@@ -33,10 +33,38 @@
         </rowConstraints>
          <children>
             <Button fx:id="btnConnect" mnemonicParsing="false" onAction="#connectToVrep" prefHeight="48.0" prefWidth="124.0" text="Connect" GridPane.halignment="CENTER" GridPane.valignment="TOP" />
-            <Button fx:id="btnAutoMode" mnemonicParsing="false" onAction="#toggleAutonomousMode" prefHeight="35.0" prefWidth="124.0" text="Auto Mode: OFF" translateY="55.0" GridPane.halignment="CENTER" GridPane.valignment="TOP" />
-            <Label fx:id="lblBehavior" text="IDLE" translateY="95.0" GridPane.halignment="CENTER" GridPane.valignment="TOP">
+            <Button fx:id="btnAutoMode" mnemonicParsing="false" onAction="#toggleAutonomousMode" prefHeight="35.0" prefWidth="124.0" text="Auto Mode: OFF" GridPane.columnIndex="1" GridPane.rowIndex="0" GridPane.halignment="CENTER" GridPane.valignment="TOP" />
+            <Label fx:id="lblBehavior" text="IDLE" GridPane.columnIndex="1" GridPane.rowIndex="0" GridPane.halignment="CENTER" GridPane.valignment="TOP" alignment="CENTER" translateY="45.0">
                <font>
                   <Font name="System Bold" size="14.0" />
+               </font>
+            </Label>
+            <Label fx:id="lblBattery" text="Battery: 100%" GridPane.columnIndex="1" GridPane.rowIndex="0" GridPane.halignment="CENTER" GridPane.valignment="TOP" alignment="CENTER" translateY="75.0">
+               <font>
+                  <Font name="System Bold" size="12.0" />
+               </font>
+            </Label>
+            <Label fx:id="lblBatteryTime" text="Time: 0s" GridPane.columnIndex="1" GridPane.rowIndex="0" GridPane.halignment="CENTER" GridPane.valignment="TOP" alignment="CENTER" translateY="100.0">
+               <font>
+                  <Font size="10.0" />
+               </font>
+            </Label>
+            <Label fx:id="lblBatteryRate" text="Rate: 1x" GridPane.columnIndex="1" GridPane.rowIndex="0" GridPane.halignment="CENTER" GridPane.valignment="TOP" alignment="CENTER" translateY="175.0">
+               <font>
+                  <Font size="10.0" />
+               </font>
+            </Label>
+            <Button fx:id="btnDrainFaster" mnemonicParsing="false" prefHeight="18.0" prefWidth="80.0" text="Drain x2" GridPane.columnIndex="1" GridPane.rowIndex="0" GridPane.halignment="CENTER" GridPane.valignment="TOP" translateY="200.0" />
+            <Button fx:id="btnDrainSlower" mnemonicParsing="false" prefHeight="18.0" prefWidth="80.0" text="Drain /2" GridPane.columnIndex="1" GridPane.rowIndex="0" GridPane.halignment="CENTER" GridPane.valignment="TOP" translateY="225.0" />
+            <Button fx:id="btnFastCharge" mnemonicParsing="false" prefHeight="18.0" prefWidth="80.0" text="Fast Charge" GridPane.columnIndex="1" GridPane.rowIndex="0" GridPane.halignment="CENTER" GridPane.valignment="TOP" translateY="250.0" />
+            <Label fx:id="lblCharging" text="" GridPane.columnIndex="1" GridPane.rowIndex="0" GridPane.halignment="CENTER" GridPane.valignment="TOP" alignment="CENTER" translateY="125.0">
+               <font>
+                  <Font name="System Bold" size="11.0" />
+               </font>
+            </Label>
+            <Label fx:id="lblDistance" text="Distance: 0.00m" GridPane.columnIndex="1" GridPane.rowIndex="0" GridPane.halignment="CENTER" GridPane.valignment="TOP" alignment="CENTER" translateY="150.0">
+               <font>
+                  <Font size="10.0" />
                </font>
             </Label>
             <Label text="GPS" GridPane.halignment="CENTER" GridPane.rowIndex="2" GridPane.valignment="CENTER">
@@ -52,6 +80,51 @@
             <Label layoutX="834.0" layoutY="13.0" text="Wheels" GridPane.columnIndex="2" GridPane.halignment="CENTER" GridPane.rowIndex="2" GridPane.valignment="CENTER">
                <font>
                   <Font name="System Bold" size="30.0" />
+               </font>
+            </Label>
+            <Label text="TLU Stats" GridPane.columnIndex="3" GridPane.halignment="CENTER" GridPane.valignment="TOP">
+               <font>
+                  <Font name="System Bold" size="16.0" />
+               </font>
+            </Label>
+            <Label fx:id="lblTluAvoid" text="Avoid TLU: -1" translateY="25.0" GridPane.columnIndex="3" GridPane.halignment="CENTER" GridPane.valignment="TOP">
+               <font>
+                  <Font size="11.0" />
+               </font>
+            </Label>
+            <Label fx:id="lblTluTrack" text="Track TLU: -1" translateY="45.0" GridPane.columnIndex="3" GridPane.halignment="CENTER" GridPane.valignment="TOP">
+               <font>
+                  <Font size="11.0" />
+               </font>
+            </Label>
+            <Label fx:id="lblTluClean" text="Clean TLU: -1" translateY="65.0" GridPane.columnIndex="3" GridPane.halignment="CENTER" GridPane.valignment="TOP">
+               <font>
+                  <Font size="11.0" />
+               </font>
+            </Label>
+            <Label fx:id="lblTluWander" text="Wander TLU: -1" translateY="85.0" GridPane.columnIndex="3" GridPane.halignment="CENTER" GridPane.valignment="TOP">
+               <font>
+                  <Font size="11.0" />
+               </font>
+            </Label>
+            <Label fx:id="lblAvoidCount" text="Avoid: 0" translateY="110.0" GridPane.columnIndex="3" GridPane.halignment="CENTER" GridPane.valignment="TOP">
+               <font>
+                  <Font size="10.0" />
+               </font>
+            </Label>
+            <Label fx:id="lblTrackCount" text="Track: 0" translateY="130.0" GridPane.columnIndex="3" GridPane.halignment="CENTER" GridPane.valignment="TOP">
+               <font>
+                  <Font size="10.0" />
+               </font>
+            </Label>
+            <Label fx:id="lblCleanCount" text="Clean: 0" translateY="150.0" GridPane.columnIndex="3" GridPane.halignment="CENTER" GridPane.valignment="TOP">
+               <font>
+                  <Font size="10.0" />
+               </font>
+            </Label>
+            <Label fx:id="lblWanderCount" text="Wander: 0" translateY="170.0" GridPane.columnIndex="3" GridPane.halignment="CENTER" GridPane.valignment="TOP">
+               <font>
+                  <Font size="10.0" />
                </font>
             </Label>
             <GridPane prefWidth="0.0" GridPane.halignment="CENTER" GridPane.rowIndex="1" GridPane.valignment="CENTER">

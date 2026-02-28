@@ -1,0 +1,22 @@
+=== EXPERIMENT SUMMARY ===
+End reason       : DOCKED_AND_CHARGED
+Total time       : 945.6 seconds
+Distance travelled: 57.31 metres
+Coverage: 30.4% of room area
+Final GPS        : (1.56, -0.96)
+Final battery    : 100.0%
+Waypoints reached: 24 (0 full passes + 24 partial)
+
+Behaviour activations (ticks):
+  AVOID  : 2268
+  TRACK  : 6124
+  CLEAN  : 23251
+  WANDER : 0
+
+Charger location : (1.78, -0.78)
+Room boundaries  : [-2.15, 2.15] x [-2.15, 2.15]
+Cleaning area    : [-1.65, 1.65] x [-1.65, 1.65]
+Wall margin      : 0.5 metres
+Lane spacing     : 0.3 metres
+AVOID fraction   : 7.2%
+Docked           : true
