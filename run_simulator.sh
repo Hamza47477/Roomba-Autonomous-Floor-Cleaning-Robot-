@@ -38,15 +38,21 @@ export LD_LIBRARY_PATH=".:lib/javacv:$COPPELIA_DIR/lib:$LD_LIBRARY_PATH"
 CLASSPATH="lib/javacv/javacpp-1.5.5.jar:lib/javacv/javacpp-1.5.5-linux-x86_64.jar:lib/javacv/javacv-1.5.5.jar:lib/javacv/opencv-4.5.1-1.5.5.jar:lib/javacv/opencv-4.5.1-1.5.5-linux-x86_64.jar:lib/javacv/openblas-0.3.13-1.5.5.jar:lib/javacv/openblas-0.3.13-1.5.5-linux-x86_64.jar:$JAVAFX_LIB/*"
 echo "✓ Library paths configured"
 
-# Verify build exists
+# Compile latest source
 echo ""
-echo "[3/4] Verifying compiled files..."
-CLASS_COUNT=$(find "out/production/V-Rep v5" -name "*.class" 2>/dev/null | wc -l)
-if [ "$CLASS_COUNT" -lt 10 ]; then
-    echo "❌ Build not found! Run compilation first."
+echo "[3/4] Compiling latest source..."
+mkdir -p "out/production/V-Rep v5"
+COMPILE_CP="lib/javacv/javacpp-1.5.5.jar:lib/javacv/javacpp-1.5.5-linux-x86_64.jar:lib/javacv/javacv-1.5.5.jar:lib/javacv/opencv-4.5.1-1.5.5.jar:lib/javacv/opencv-4.5.1-1.5.5-linux-x86_64.jar:lib/javacv/openblas-0.3.13-1.5.5.jar:lib/javacv/openblas-0.3.13-1.5.5-linux-x86_64.jar:$JAVAFX_LIB/*"
+find src -name "*.java" | xargs javac \
+    -cp "$COMPILE_CP" \
+    --module-path "$JAVAFX_LIB" --add-modules javafx.controls,javafx.fxml \
+    -d "out/production/V-Rep v5" 2>&1
+if [ $? -ne 0 ]; then
+    echo "❌ Compilation failed — fix errors before running."
     exit 1
 fi
-echo "✓ Found $CLASS_COUNT compiled classes"
+CLASS_COUNT=$(find "out/production/V-Rep v5" -name "*.class" | wc -l)
+echo "✓ Compiled $CLASS_COUNT classes from src/"
 
 # Launch application
 echo ""

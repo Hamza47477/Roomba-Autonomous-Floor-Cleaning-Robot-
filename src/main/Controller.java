@@ -21,10 +21,8 @@ import utils.Timer;
 import utils.Utils;
 
 import java.awt.*;
-import java.util.Arrays;
 import java.awt.image.BufferedImage;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.io.PrintWriter;
 import java.io.FileWriter;
@@ -37,2146 +35,1107 @@ import static org.bytedeco.opencv.global.opencv_imgproc.CV_TM_CCOEFF_NORMED;
 import static org.bytedeco.opencv.global.opencv_imgproc.cvRectangle;
 
 /**
- * Created by Theo Theodoridis.
- * Class    : Controller
- * Version  : v2.0
- * Date     : © Copyright 01/11/2020
- * User     : ttheod
- * email    : ttheod@gmail.com
- * Comments : Refactored with TLU-based Subsumption Architecture.
- **/
-
+ * Controller v4.0 — Hybrid Encoder+GPS Heading, GPS Validity Guard
+ *
+ * TWO BUGS FIXED vs v3:
+ *
+ * BUG 1 — GPS cold-start Long.MAX_VALUE overflow
+ *   V-REP returns garbage (≈9.2e16) on the first few GPS reads before
+ *   the simulation socket is ready. v3 used this value to seed the
+ *   heading calibration and waypoint selection, corrupting everything.
+ *   FIX: isGpsValid() rejects |x| or |y| > 4 m. CLEAN holds still
+ *   (setVel 0,0) until GPS settles to a sane room coordinate.
+ *
+ * BUG 2 — Heading estimator deadlock (spin forever, never translate)
+ *   v3 used GPS movement to estimate heading, but heading is required
+ *   before the robot will move → GPS never changes → heading never
+ *   updates → robot spins forever at 146° without progressing.
+ *   FIX: HYBRID estimator:
+ *     PRIMARY  = encoder differential integration (works during spin)
+ *     SECONDARY = GPS bearing calibration (snaps drift every ≥5 cm)
+ *   The encoder integration updates headingEst every tick regardless
+ *   of whether the robot is spinning or translating, so the heading
+ *   error naturally decreases during the spin and the robot starts
+ *   moving forward — no deadlock possible.
+ */
 public class Controller {
-    @FXML
-    private Button btnConnect;
-    @FXML
-    private Button btnRight;
-    @FXML
-    private Button btnLeft;
-    @FXML
-    private Button btnBack;
-    @FXML
-    private Button btnForward;
-    @FXML
-    private Button btnStop;
-    @FXML
-    private Canvas canvasCamera;
-    @FXML
-    PixelWriter pw;
-    @FXML
-    private Label lblSensor0;
-    @FXML
-    private Label lblSensor1;
-    @FXML
-    private Label lblSensor2;
-    @FXML
-    private Label lblSensor3;
-    @FXML
-    private Label lblSensor4;
-    @FXML
-    private Label lblSensor5;
-    @FXML
-    private Label lbl;
-    @FXML
-    private Label lblGpsX;
-    @FXML
-    private Label lblGpsY;
-    @FXML
-    private Label lblGpsZ;
-    @FXML
-    private Label lblRightWheel;
-    @FXML
-    private Label lblLeftWheel;
 
-    // Autonomous mode controls:
-    @FXML
-    private Button btnAutoMode;
-    @FXML
-    private Label lblBehavior;
-    @FXML
-    private Label lblBattery;
-    @FXML
-    private Label lblBatteryTime;
-    @FXML
-    private Label lblBatteryRate;
-    @FXML
-    private Label lblCharging;
-    @FXML
-    private Label lblDistance;
-    @FXML
-    private Button btnDrainFaster;
-    @FXML
-    private Button btnDrainSlower;
-    @FXML
-    private Button btnFastCharge;
-
-    // TLU status labels:
-    @FXML
-    private Label lblTluAvoid;
-    @FXML
-    private Label lblTluTrack;
-    @FXML
-    private Label lblTluClean;
-    @FXML
-    private Label lblTluWander;
-    @FXML
-    private Label lblAvoidCount;
-    @FXML
-    private Label lblTrackCount;
-    @FXML
-    private Label lblCleanCount;
-    @FXML
-    private Label lblWanderCount;
-
-    // Battery drain rate multiplier (1.0 = normal, 2.0 = double speed, etc.):
-    private double batteryDrainRate = 1.0;
-    /** Extra seconds consumed per tick when drainRate > 1 — applied manually in run(). */
-    private int batteryBonusDrainCounter = 0;
+    @FXML private Button btnConnect;
+    @FXML private Button btnAutoMode;
+    @FXML private Button btnRight, btnLeft, btnBack, btnForward, btnStop;
+    @FXML private Canvas canvasCamera;
+    @FXML PixelWriter pw;
+    @FXML private Label lblSensor0, lblSensor1, lblSensor2, lblSensor3, lblSensor4, lblSensor5;
+    @FXML private Label lbl, lblGpsX, lblGpsY, lblGpsZ, lblRightWheel, lblLeftWheel;
+    @FXML private Label lblBattery, lblBatteryTime, lblBehavior, lblDistance;
 
     private String defaultButtonStyle;
 
-    /**
-     * Updates:
-     **/
+    private Color   imageCamera[][];
+    private double  gpsValues[]     = new double[3];
+    private double  sonarValues[]   = new double[6];
+    private double  encoderValues[] = new double[2];
 
-    private Color imageCamera[][];
-    private double gpsValues[] = new double[3];
-    private double sonarValues[] = new double[6];
-    private double encoderValues[] = new double[2];
+    private boolean runGPS = true, runCamera = true, runMotion = true;
+    private boolean runSensors = true, runWheelEncoder = true;
 
-    private boolean runGPS = true;
-    private boolean runCamera = true;
-    private boolean runMotion = true;
-    private boolean runSensors = true;
-    private boolean runWheelEncoder = true;
+    private IntW cameraHandle = new IntW(1), leftWheelHandle = new IntW(1), rightWheelHandle = new IntW(1);
 
-    /**
-     * Robot:
-     **/
+    private boolean running = false, firstCameraRead = true;
+    private boolean firstSensor0Read=true,firstSensor1Read=true,firstSensor2Read=true;
+    private boolean firstSensor3Read=true,firstSensor4Read=true,firstSensor5Read=true;
+    private boolean firstLeftWheelCall=true, firstRightWheelCall=true;
 
-    private IntW cameraHandle = new IntW(1);
-    private IntW leftWheelHandle = new IntW(1);
-    private IntW rightWheelHandle = new IntW(1);
+    private char dir = 's';
+    private int  vel = 5;
 
-    private boolean running = false;
-    private boolean firstCameraRead = true;
-    private boolean firstSensor0Read = true;
-    private boolean firstSensor1Read = true;
-    private boolean firstSensor2Read = true;
-    private boolean firstSensor3Read = true;
-    private boolean firstSensor4Read = true;
-    private boolean firstSensor5Read = true;
-    private boolean firstLeftWheelCall = true;
-    private boolean firstRightWheelCall = true;
-
-    private char dir = 's'; // Direction.
-    private int vel = 5;    // Velocity.
-
-    /**
-     * Camera:
-     **/
-
-    private double targetMinScore = 0.0;
-    private double targetMaxScore = 0.0;
-
+    private double targetMinScore=0, targetMaxScore=0;
     private int resolutionCamera = 256;
     private CvPoint point = new CvPoint();
-    private IntWA resolution = new IntWA(1);
-    private CharWA image = new CharWA(resolutionCamera * resolutionCamera * 3);
-    private char imageArray[] = new char[resolutionCamera * resolutionCamera * 3];
-    private Color colorMatrix[][] = new Color[resolutionCamera][resolutionCamera];
-    private BufferedImage bufferedImage = new BufferedImage(resolutionCamera, resolutionCamera, BufferedImage.TYPE_INT_RGB);
+    private IntWA   resolution = new IntWA(1);
+    private CharWA  image = new CharWA(resolutionCamera*resolutionCamera*3);
+    private char    imageArray[] = new char[resolutionCamera*resolutionCamera*3];
+    private Color   colorMatrix[][] = new Color[resolutionCamera][resolutionCamera];
+    private BufferedImage bufferedImage = new BufferedImage(resolutionCamera,resolutionCamera,BufferedImage.TYPE_INT_RGB);
 
-    /**
-     * Wheel encoders:
-     **/
-
-    private float dxRight = 0;
-    private float totalRightJointPosition = 0;
-    private float currentRightJointPosition = 0;
-    private float previousRightJointPosition = 0;
+    private float dxRight=0,dxLeft=0;
+    private float totalRightJointPosition=0,currentRightJointPosition=0,previousRightJointPosition=0;
+    private float totalLeftJointPosition=0, currentLeftJointPosition=0, previousLeftJointPosition=0;
     private FloatW robotRightJointPosition = new FloatW(3);
+    private FloatW robotLeftJointPosition  = new FloatW(3);
 
-    private float dxLeft = 0;
-    private float totalLeftJointPosition = 0;
-    private float currentLeftJointPosition = 0;
-    private float previousLeftJointPosition = 0;
-    private FloatW robotLeftJointPosition = new FloatW(3);
-
-    /**
-     * GPS:
-     **/
-
-    public static final double CHARGER_XCOORD = 1.78;  // The charger X coordinate.
-    public static final double CHARGER_YCOORD = -0.78; // The charger Y coordinate.
-    public static final double MAX_GPS_DIST = 5.0;   // The max Euclidean distance from the charger.
-
-    /**
-     * V-rep communication:
-     **/
+    public static final double CHARGER_XCOORD = 1.78;
+    public static final double CHARGER_YCOORD = -0.78;
 
     private remoteApi vRep = new remoteApi();
     private int clientID = -1;
 
-    /**
-     * Timers:
-     **/
-
-    private int MAX_BATT_TIME = 60 * 45; // Default 45 mins battery time.
-    private final int MAX_BATT_VOLT = 12;      // volts.
-
+    // MAX_BATT_TIME = 750s → battery drains from 100% to 0% in 12.5 min
+    // → reaches 20% at exactly 10 minutes (600s), matching assignment spec.
+    // Formula: pct = (1 - t/MAX_BATT_TIME)*100  →  20 = (1-600/750)*100 ✓
+    private int   MAX_BATT_TIME = 750;
+    private final int MAX_BATT_VOLT = 12;
     private Timer motionTimer = new Timer();
     private Timer batteryTimer = new Timer();
-    private Timer wanderTimer = new Timer();
 
+    // ==========================================
+    //  Battery
+    // ==========================================
+    // chargeOffset: added to raw timer reading to simulate charging.
+    // While docked, this grows at CHARGE_RATE_PER_SEC per second, effectively
+    // reversing the battery drain → getBatteryCapacity increases toward 100%.
+    private double chargeOffset = 0.0;
+    private static final double CHARGE_RATE_PER_SEC = 750.0 / 10.0; // full charge in 10s wall-clock
 
-    /********************************************************************************************************************
-     *                                                   Battery::Methods                                               *
-     ********************************************************************************************************************/
-
-    public int getBatteryTime() {
-        return (batteryTimer.getSec());
+    public int     getBatteryTime()     { return batteryTimer.getSec(); }
+    public boolean getBatteryState()    { return getBatteryCapacity() > 0.0; }
+    public void    setBatteryTime(int min) {
+        MAX_BATT_TIME = 60*min; motionTimer.setSec(MAX_BATT_TIME); motionTimer.restart();
     }
-
-    public void setBatteryTime(int min) {
-        MAX_BATT_TIME = 60 * min;
-        motionTimer.setSec(MAX_BATT_TIME);
-        motionTimer.restart();
-        wanderTimer.setSec(MAX_BATT_TIME);
-        wanderTimer.restart();
-    }
-
     public double getBatteryCapacity() {
-        double v = (double) MAX_BATT_VOLT - Utils.map(batteryTimer.getSec(), 0, (double) MAX_BATT_TIME, 0, (double) MAX_BATT_VOLT);
-        return ((v > 0.0) ? v : 0.0);
+        // Subtract chargeOffset from the elapsed seconds so that charging
+        // appears to "rewind" the timer, increasing remaining capacity.
+        double effectiveSec = Math.max(0.0, batteryTimer.getSec() - chargeOffset);
+        double v = MAX_BATT_VOLT - Utils.map(effectiveSec, 0, (double)MAX_BATT_TIME, 0, (double)MAX_BATT_VOLT);
+        return Math.max(0.0, v);
     }
-
     public double getBatteryPercentage() {
-        // If currently charging, return the gradually increasing override value
-        if (chargingOverridePct >= 0) {
-            return Math.round(chargingOverridePct * 10.0) / 10.0;
-        }
-        double v = getBatteryCapacity();
-        // Continuous percentage: linear map from 0V-12V to 0%-100%
-        double pct = (v / (double) MAX_BATT_VOLT) * 100.0;
-        return Math.max(0.0, Math.min(100.0, Math.round(pct * 10.0) / 10.0));
+        return Math.max(0, Math.min(100, Math.round((getBatteryCapacity()/MAX_BATT_VOLT)*1000.0)/10.0));
     }
 
-    public boolean getBatteryState() {
-        // If we are actively charging, battery is alive regardless of timer value
-        if (chargingOverridePct >= 0) return true;
-        double v = getBatteryCapacity();
-        return ((v > 0.0) ? true : false);
-    }
-
-
-    /********************************************************************************************************************
-     *                                                   Wheel::Methods                                                 *
-     ********************************************************************************************************************/
-
+    // ==========================================
+    //  Encoders
+    // ==========================================
     private double readRightWheelEnc() {
         if (firstRightWheelCall) {
-            vRep.simxGetJointPosition(clientID, rightWheelHandle.getValue(), robotRightJointPosition, remoteApi.simx_opmode_streaming);
-            currentRightJointPosition = robotRightJointPosition.getValue();
-            previousRightJointPosition = robotRightJointPosition.getValue();
-            firstRightWheelCall = false;
-            totalRightJointPosition = 0;
+            vRep.simxGetJointPosition(clientID,rightWheelHandle.getValue(),robotRightJointPosition,remoteApi.simx_opmode_streaming);
+            currentRightJointPosition=previousRightJointPosition=robotRightJointPosition.getValue();
+            firstRightWheelCall=false; totalRightJointPosition=0;
         } else {
-            vRep.simxGetJointPosition(clientID, rightWheelHandle.getValue(), robotRightJointPosition, remoteApi.simx_opmode_buffer);
-            currentRightJointPosition = robotRightJointPosition.getValue();
-            dxRight = getAngleMinusAlpha(currentRightJointPosition, previousRightJointPosition);
-            totalRightJointPosition += dxRight;
+            vRep.simxGetJointPosition(clientID,rightWheelHandle.getValue(),robotRightJointPosition,remoteApi.simx_opmode_buffer);
+            currentRightJointPosition=robotRightJointPosition.getValue();
+            dxRight=getAngleMinusAlpha(currentRightJointPosition,previousRightJointPosition);
+            totalRightJointPosition+=dxRight;
         }
-        previousRightJointPosition = currentRightJointPosition;
-        return (Math.round((totalRightJointPosition / (2 * Math.PI)) * 100d) / 100d);
+        previousRightJointPosition=currentRightJointPosition;
+        return Math.round((totalRightJointPosition/(2*Math.PI))*100d)/100d;
     }
-
     private double readLeftWheelEnc() {
         if (firstLeftWheelCall) {
-            vRep.simxGetJointPosition(clientID, leftWheelHandle.getValue(), robotLeftJointPosition, remoteApi.simx_opmode_streaming);
-            currentLeftJointPosition = robotLeftJointPosition.getValue();
-            previousLeftJointPosition = robotLeftJointPosition.getValue();
-            firstLeftWheelCall = false;
-            totalLeftJointPosition = 0;
+            vRep.simxGetJointPosition(clientID,leftWheelHandle.getValue(),robotLeftJointPosition,remoteApi.simx_opmode_streaming);
+            currentLeftJointPosition=previousLeftJointPosition=robotLeftJointPosition.getValue();
+            firstLeftWheelCall=false; totalLeftJointPosition=0;
         } else {
-            vRep.simxGetJointPosition(clientID, leftWheelHandle.getValue(), robotLeftJointPosition, remoteApi.simx_opmode_buffer);
-            currentLeftJointPosition = robotLeftJointPosition.getValue();
-            dxLeft = getAngleMinusAlpha(currentLeftJointPosition, previousLeftJointPosition);
-            totalLeftJointPosition += dxLeft;
+            vRep.simxGetJointPosition(clientID,leftWheelHandle.getValue(),robotLeftJointPosition,remoteApi.simx_opmode_buffer);
+            currentLeftJointPosition=robotLeftJointPosition.getValue();
+            dxLeft=getAngleMinusAlpha(currentLeftJointPosition,previousLeftJointPosition);
+            totalLeftJointPosition+=dxLeft;
         }
-        previousLeftJointPosition = currentLeftJointPosition;
-
-        return (Math.round((totalLeftJointPosition / (2 * Math.PI)) * 100d) / 100d);
+        previousLeftJointPosition=currentLeftJointPosition;
+        return Math.round((totalLeftJointPosition/(2*Math.PI))*100d)/100d;
     }
-
-    private float getAngleMinusAlpha(float angle, float alpha) {
-        double sinAngle0 = Math.sin(angle);
-        double sinAngle1 = Math.sin(alpha);
-        double cosAngle0 = Math.cos(angle);
-        double cosAngle1 = Math.cos(alpha);
-        double sin_da = sinAngle0 * cosAngle1 - cosAngle0 * sinAngle1;
-        double cos_da = cosAngle0 * cosAngle1 + sinAngle0 * sinAngle1;
-        return ((float) Math.atan2(sin_da, cos_da));
+    private float getAngleMinusAlpha(float a, float b) {
+        double s=Math.sin(a)*Math.cos(b)-Math.cos(a)*Math.sin(b);
+        double c=Math.cos(a)*Math.cos(b)+Math.sin(a)*Math.sin(b);
+        return (float)Math.atan2(s,c);
     }
+    public double getLeftWheelEnc()  { return encoderValues[0]; }
+    public double getRightWheelEnc() { return encoderValues[1]; }
+    public int    getEncoderNo()     { return 2; }
 
-    public double getLeftWheelEnc() {
-        return (encoderValues[0]);
-    }
-
-    public double getRightWheelEnc() {
-        return (encoderValues[1]);
-    }
-
-    public int getEncoderNo() {
-        return (2);
-    }
-
-
-    /********************************************************************************************************************
-     *                                                   GPS::Methods                                                   *
-     ********************************************************************************************************************/
-
+    // ==========================================
+    //  GPS
+    // ==========================================
     public double[] readGPS() {
-        IntW baseHandle = new IntW(1);
-        FloatWA position = new FloatWA(3);
-        vRep.simxGetObjectHandle(clientID, "Roomba", baseHandle, remoteApi.simx_opmode_streaming);
-        vRep.simxGetObjectPosition(clientID, baseHandle.getValue(), -1, position, remoteApi.simx_opmode_streaming);
-        double positions[] = new double[position.getArray().length];
+        IntW bh=new IntW(1); FloatWA pos=new FloatWA(3);
+        vRep.simxGetObjectHandle(clientID,"Roomba",bh,remoteApi.simx_opmode_streaming);
+        vRep.simxGetObjectPosition(clientID,bh.getValue(),-1,pos,remoteApi.simx_opmode_streaming);
+        double[] p=new double[3];
+        p[0]=Math.round((double)pos.getArray()[0]*100.0)/100.0;
+        p[1]=Math.round((double)pos.getArray()[1]*100.0)/100.0;
+        p[2]=Math.round((double)pos.getArray()[2]*100.0)/100.0;
+        return p;
+    }
+    public double getGPSX()  { return gpsValues[0]; }
+    public double getGPSY()  { return gpsValues[1]; }
+    public double getGPSZ()  { return gpsValues[2]; }
+    public int    getGPSNo() { return 3; }
 
-        positions[0] = Math.round((double) position.getArray()[0] * 100.0) / 100.0;
-        positions[1] = Math.round((double) position.getArray()[1] * 100.0) / 100.0;
-        positions[2] = Math.round((double) position.getArray()[2] * 100.0) / 100.0;
-
-        return (positions);
+    /**
+     * Validates GPS. The room is ±2.15 m. V-REP returns ~9.2e16 on cold start
+     * (Long.MAX_VALUE / 100 overflow). Reject anything outside ±4 m.
+     */
+    private boolean isGpsValid(double x, double y) {
+        return Math.abs(x) < 4.0 && Math.abs(y) < 4.0;
     }
 
-    public double getGPSX() {
-        return (gpsValues[0]);
-    }
-
-    public double getGPSY() {
-        return (gpsValues[1]);
-    }
-
-    public double getGPSZ() {
-        return (gpsValues[2]);
-    }
-
-    public int getGPSNo() {
-        return (3);
-    }
-
-
-    /********************************************************************************************************************
-     *                                                   Ultrasonic::Methods                                            *
-     ********************************************************************************************************************/
-
+    // ==========================================
+    //  Sonar
+    // ==========================================
     private double readSonarRange(int sensor) {
-        String sensorText = "";
-
-        BoolW detectionState = new BoolW(false);
-        FloatWA detectedPoint = new FloatWA(1); //Coordinates relatives to the sensor's frame
-        IntW detectedObjectHandle = new IntW(1);
-        FloatWA detectedSurfaceNormalVector = new FloatWA(1);
-
-        IntW sensorHandle = new IntW(1);
-        switch (sensor) {
-            case 0:
-                vRep.simxGetObjectHandle(clientID, "Proximity_sensor0", sensorHandle, remoteApi.simx_opmode_blocking);
-                if (!firstSensor0Read) {
-                    vRep.simxReadProximitySensor(clientID, sensorHandle.getValue(), detectionState, detectedPoint, detectedObjectHandle, detectedSurfaceNormalVector, remoteApi.simx_opmode_buffer);
-                } else {
-                    vRep.simxReadProximitySensor(clientID, sensorHandle.getValue(), detectionState, detectedPoint, detectedObjectHandle, detectedSurfaceNormalVector, remoteApi.simx_opmode_streaming);
-                    firstSensor0Read = false;
-                }
-                break;
-            case 1:
-                vRep.simxGetObjectHandle(clientID, "Proximity_sensor1", sensorHandle, remoteApi.simx_opmode_blocking);
-                if (!firstSensor1Read) {
-                    vRep.simxReadProximitySensor(clientID, sensorHandle.getValue(), detectionState, detectedPoint, detectedObjectHandle, detectedSurfaceNormalVector, remoteApi.simx_opmode_buffer);
-                } else {
-                    vRep.simxReadProximitySensor(clientID, sensorHandle.getValue(), detectionState, detectedPoint, detectedObjectHandle, detectedSurfaceNormalVector, remoteApi.simx_opmode_streaming);
-                    firstSensor1Read = false;
-                }
-                break;
-            case 2:
-                vRep.simxGetObjectHandle(clientID, "Proximity_sensor2", sensorHandle, remoteApi.simx_opmode_blocking);
-                if (!firstSensor2Read) {
-                    vRep.simxReadProximitySensor(clientID, sensorHandle.getValue(), detectionState, detectedPoint, detectedObjectHandle, detectedSurfaceNormalVector, remoteApi.simx_opmode_buffer);
-                } else {
-                    vRep.simxReadProximitySensor(clientID, sensorHandle.getValue(), detectionState, detectedPoint, detectedObjectHandle, detectedSurfaceNormalVector, remoteApi.simx_opmode_streaming);
-                    firstSensor2Read = false;
-                }
-                break;
-            case 3:
-                vRep.simxGetObjectHandle(clientID, "Proximity_sensor3", sensorHandle, remoteApi.simx_opmode_blocking);
-                if (!firstSensor3Read) {
-                    vRep.simxReadProximitySensor(clientID, sensorHandle.getValue(), detectionState, detectedPoint, detectedObjectHandle, detectedSurfaceNormalVector, remoteApi.simx_opmode_buffer);
-                } else {
-                    vRep.simxReadProximitySensor(clientID, sensorHandle.getValue(), detectionState, detectedPoint, detectedObjectHandle, detectedSurfaceNormalVector, remoteApi.simx_opmode_streaming);
-                    firstSensor3Read = false;
-                }
-                break;
-            case 4:
-                vRep.simxGetObjectHandle(clientID, "Proximity_sensor4", sensorHandle, remoteApi.simx_opmode_blocking);
-                if (!firstSensor4Read) {
-                    vRep.simxReadProximitySensor(clientID, sensorHandle.getValue(), detectionState, detectedPoint, detectedObjectHandle, detectedSurfaceNormalVector, remoteApi.simx_opmode_buffer);
-                } else {
-                    vRep.simxReadProximitySensor(clientID, sensorHandle.getValue(), detectionState, detectedPoint, detectedObjectHandle, detectedSurfaceNormalVector, remoteApi.simx_opmode_streaming);
-                    firstSensor4Read = false;
-                }
-                break;
-            case 5:
-                vRep.simxGetObjectHandle(clientID, "Proximity_sensor5", sensorHandle, remoteApi.simx_opmode_blocking);
-                if (!firstSensor5Read) {
-                    vRep.simxReadProximitySensor(clientID, sensorHandle.getValue(), detectionState, detectedPoint, detectedObjectHandle, detectedSurfaceNormalVector, remoteApi.simx_opmode_buffer);
-                } else {
-                    vRep.simxReadProximitySensor(clientID, sensorHandle.getValue(), detectionState, detectedPoint, detectedObjectHandle, detectedSurfaceNormalVector, remoteApi.simx_opmode_streaming);
-                    firstSensor5Read = false;
-                }
-                break;
-        }
-
-        float detectedPointXYZ[] = detectedPoint.getArray();
-        double distance = Math.sqrt(Math.pow(detectedPointXYZ[0], 2) + Math.pow(detectedPointXYZ[1], 2) + Math.pow(detectedPointXYZ[2], 2));
-        distance = Math.round(distance * 100d) / 100d;
-        distance = Utils.getDecimal(distance, "0.0");
-        distance = (distance >= 1.0) ? 1.0 : distance;
-        distance = (distance == 0.0) ? 1.0 : distance;
-
-        if (detectionState.getValue())
-            return (distance);
-        return (1.0);
+        BoolW det=new BoolW(false); FloatWA dp=new FloatWA(1);
+        IntW doh=new IntW(1); FloatWA dsn=new FloatWA(1); IntW sh=new IntW(1);
+        vRep.simxGetObjectHandle(clientID,"Proximity_sensor"+sensor,sh,remoteApi.simx_opmode_blocking);
+        boolean[] fr={firstSensor0Read,firstSensor1Read,firstSensor2Read,firstSensor3Read,firstSensor4Read,firstSensor5Read};
+        int mode=fr[sensor]?remoteApi.simx_opmode_streaming:remoteApi.simx_opmode_buffer;
+        vRep.simxReadProximitySensor(clientID,sh.getValue(),det,dp,doh,dsn,mode);
+        switch(sensor){case 0:firstSensor0Read=false;break;case 1:firstSensor1Read=false;break;
+            case 2:firstSensor2Read=false;break;case 3:firstSensor3Read=false;break;
+            case 4:firstSensor4Read=false;break;case 5:firstSensor5Read=false;break;}
+        float[] xyz=dp.getArray();
+        double d=Math.sqrt(xyz[0]*xyz[0]+xyz[1]*xyz[1]+xyz[2]*xyz[2]);
+        d=Math.round(d*100d)/100d; d=Utils.getDecimal(d,"0.0");
+        if(d>=1.0||d==0.0) d=1.0;
+        return det.getValue()?d:1.0;
     }
+    private double[] readSonars() { for(int i=0;i<getSonarNo();i++) sonarValues[i]=readSonarRange(i); return sonarValues; }
+    public double getSonarRange(int s) { return sonarValues[s]; }
+    public int    getSonarNo()         { return sonarValues.length; }
 
-    private double[] readSonars() {
-        for (int i = 0; i < getSonarNo(); i++)
-            sonarValues[i] = readSonarRange(i);
-        return (sonarValues);
-    }
-
-    private double[] getSonarRanges() {
-        return (sonarValues);
-    }
-
-    public double getSonarRange(int sensor) {
-        return (sonarValues[sensor]);
-    }
-
-    public int getSonarNo() {
-        return (sonarValues.length);
-    }
-
-
-    /********************************************************************************************************************
-     *                                                   Camera::Methods                                                *
-     ********************************************************************************************************************/
-
+    // ==========================================
+    //  Camera
+    // ==========================================
     private Color[][] readCamera() {
-        if (firstCameraRead) {
-            vRep.simxGetVisionSensorImage(clientID, cameraHandle.getValue(), resolution, image, 2, remoteApi.simx_opmode_streaming);
-            firstCameraRead = false;
-        } else
-            vRep.simxGetVisionSensorImage(clientID, cameraHandle.getValue(), resolution, image, 2, remoteApi.simx_opmode_buffer);
-        return (imageToColor(image));
+        if(firstCameraRead){vRep.simxGetVisionSensorImage(clientID,cameraHandle.getValue(),resolution,image,2,remoteApi.simx_opmode_streaming);firstCameraRead=false;}
+        else{vRep.simxGetVisionSensorImage(clientID,cameraHandle.getValue(),resolution,image,2,remoteApi.simx_opmode_buffer);}
+        return imageToColor(image);
     }
-
-    private Color[][] imageToColor(CharWA image) {
-        imageArray = image.getArray();
-        int index = 0;
-        int r, g, b;
-        Color color;
-
-        for (int i = 0; i < resolutionCamera; i++)
-            for (int j = 0; j < resolutionCamera; j++) {
-                // Retrieve the RGB Values:
-                r = (int) imageArray[index];
-                g = (int) imageArray[index + 1];
-                b = (int) imageArray[index + 2];
-                color = new Color(r, g, b);
-                colorMatrix[i][j] = color;
-
-                bufferedImage.setRGB(i, j, new Color(r, g, b).getRGB());
-                index += 3;
-            }
-        return (colorMatrix);
+    private Color[][] imageToColor(CharWA img) {
+        imageArray=img.getArray(); int idx=0;
+        for(int i=0;i<resolutionCamera;i++) for(int j=0;j<resolutionCamera;j++){
+            Color c=new Color((int)imageArray[idx],(int)imageArray[idx+1],(int)imageArray[idx+2]);
+            colorMatrix[i][j]=c; bufferedImage.setRGB(i,j,c.getRGB()); idx+=3;}
+        return colorMatrix;
     }
-
-    private int getGrayscale(BufferedImage img, int x, int y) {
-        Color c = new Color(img.getRGB(x, y));
-        int r = (int) (c.getRed() * 0.299);
-        int g = (int) (c.getGreen() * 0.587);
-        int b = (int) (c.getBlue() * 0.114);
-        return ((r + g + b));
+    private int getGrayscale(BufferedImage img,int x,int y){Color c=new Color(img.getRGB(x,y));return(int)(c.getRed()*0.299)+(int)(c.getGreen()*0.587)+(int)(c.getBlue()*0.114);}
+    private static BufferedImage rotate(BufferedImage b,double a,boolean col){
+        int w=b.getWidth(),h=b.getHeight();
+        BufferedImage r=new BufferedImage(w,h,col?b.getType():BufferedImage.TYPE_BYTE_GRAY);
+        Graphics2D g=r.createGraphics(); g.rotate(Math.toRadians(a),w/2,h/2); g.drawImage(b,null,0,0); g.dispose(); return r;
     }
-
-    private static BufferedImage rotate(BufferedImage bimg, double angle, boolean color) {
-        int imageType = -1;
-        int w = bimg.getWidth();
-        int h = bimg.getHeight();
-
-        if (color) imageType = bimg.getType();
-        else imageType = BufferedImage.TYPE_BYTE_GRAY;
-
-        BufferedImage rotated = new BufferedImage(w, h, imageType);
-        Graphics2D graphic = rotated.createGraphics();
-        graphic.rotate(Math.toRadians(angle), w / 2, h / 2);
-        graphic.drawImage(bimg, null, 0, 0);
-        graphic.dispose();
-
-        return (rotated);
-    }
-
-    public BufferedImage getImage() {
-        return (rotate(bufferedImage, -90, false));
-    }
-
-    public int getImageWidth() {
-        return (bufferedImage.getWidth());
-    }
-
-    public int getImageHeight() {
-        return (bufferedImage.getHeight());
-    }
-
-    public int getImagePixel(int x, int y) {
-        return (getGrayscale(bufferedImage, x, y));
-    }
-
-    public void setImagePixel(int x, int y, int rgb) {
-        bufferedImage.setRGB(x, y, rgb + (rgb << 8) + (rgb << 16));
-    }
-
-    public int getTargetX() {
-        return (point.x());
-    }
-
-    public int getTargetY() {
-        return (point.y());
-    }
-
-    public double getTargetMinScore() {
-        return (targetMinScore);
-    }
-
-    public double getTargetMaxScore() {
-        return (targetMaxScore);
-    }
-
-    public void displayImage() {
-        ImageViewer.display(getImage());
-    }
+    public BufferedImage getImage()          { return rotate(bufferedImage,-90,false); }
+    public int           getImageWidth()     { return bufferedImage.getWidth(); }
+    public int           getImageHeight()    { return bufferedImage.getHeight(); }
+    public int           getImagePixel(int x,int y) { return getGrayscale(bufferedImage,x,y); }
+    public void          setImagePixel(int x,int y,int rgb){bufferedImage.setRGB(x,y,rgb+(rgb<<8)+(rgb<<16));}
+    public int    getTargetX()        { return point.x(); }
+    public int    getTargetY()        { return point.y(); }
+    public double getTargetMinScore() { return targetMinScore; }
+    public double getTargetMaxScore() { return targetMaxScore; }
+    public void   displayImage()      { ImageViewer.display(getImage()); }
 
     public void templateMatchingCV(BufferedImage image) {
-        // [1]Convert BufferedImage to IplImage (grayscale source):
-        IplImage src = Java2DFrameUtils.toIplImage(image);
-
-        // [2]Load template marker image as grayscale:
-        org.bytedeco.opencv.opencv_core.Mat tmpMat = imread("data/images/marker.jpg", IMREAD_GRAYSCALE);
-        IplImage tmp = Java2DFrameUtils.toIplImage(tmpMat);
-
-        // [3]The Correlation Image Result:
-        IplImage result = cvCreateImage(cvSize(src.width() - tmp.width() + 1, src.height() - tmp.height() + 1), IPL_DEPTH_32F, 1);
-
-        // [4]Template matching:
-        cvMatchTemplate(src, tmp, result, CV_TM_CCOEFF_NORMED);
-
-        // [5]Find min and max correlation values/locations:
-        DoublePointer minVal = new DoublePointer(1);
-        DoublePointer maxVal = new DoublePointer(1);
-        CvPoint minLoc = new CvPoint();
-        CvPoint maxLoc = new CvPoint();
-        cvMinMaxLoc(result, minVal, maxVal, minLoc, maxLoc, null);
-
-        targetMinScore = minVal.get();
-        targetMaxScore = maxVal.get();
-
-        // [6]Mark the template location:
-        point.x(maxLoc.x() + tmp.width());
-        point.y(maxLoc.y() + tmp.height());
-
-        // [7]Draw the rectangle on the source image:
-        cvRectangle(src, maxLoc, point, CvScalar.GRAY, 2, 8, 0);
-
-        // [8]Display the image:
+        IplImage src=Java2DFrameUtils.toIplImage(image);
+        org.bytedeco.opencv.opencv_core.Mat tm=imread("data/images/marker.jpg",IMREAD_GRAYSCALE);
+        IplImage tmp=Java2DFrameUtils.toIplImage(tm);
+        IplImage res=cvCreateImage(cvSize(src.width()-tmp.width()+1,src.height()-tmp.height()+1),IPL_DEPTH_32F,1);
+        cvMatchTemplate(src,tmp,res,CV_TM_CCOEFF_NORMED);
+        DoublePointer minV=new DoublePointer(1),maxV=new DoublePointer(1);
+        CvPoint minL=new CvPoint(),maxL=new CvPoint();
+        cvMinMaxLoc(res,minV,maxV,minL,maxL,null);
+        targetMinScore=minV.get(); targetMaxScore=maxV.get();
+        point.x(maxL.x()+tmp.width()); point.y(maxL.y()+tmp.height());
+        cvRectangle(src,maxL,point,CvScalar.GRAY,2,8,0);
         ImageViewer.display(Java2DFrameUtils.toBufferedImage(src));
     }
 
+    // ==========================================
+    //  Motion
+    // ==========================================
+    public void forward(){resetButtonsStyle();btnForward.setStyle("-fx-background-color:#7FFF00;");dir='f';}
+    public void backward(){resetButtonsStyle();btnBack.setStyle("-fx-background-color:#7FFF00;");dir='b';}
+    public void left(){resetButtonsStyle();btnLeft.setStyle("-fx-background-color:#7FFF00;");dir='l';}
+    public void right(){resetButtonsStyle();btnRight.setStyle("-fx-background-color:#7FFF00;");dir='r';}
+    public void stop(){resetButtonsStyle();btnStop.setStyle("-fx-background-color:#7FFF00;");dir='s';}
+    private void resetButtonsStyle(){btnRight.setStyle(defaultButtonStyle);btnStop.setStyle(defaultButtonStyle);btnLeft.setStyle(defaultButtonStyle);btnForward.setStyle(defaultButtonStyle);btnBack.setStyle(defaultButtonStyle);}
+    public void setVel(float l,float r){vRep.simxSetJointTargetVelocity(clientID,leftWheelHandle.getValue(),l,remoteApi.simx_opmode_oneshot);vRep.simxSetJointTargetVelocity(clientID,rightWheelHandle.getValue(),r,remoteApi.simx_opmode_oneshot);}
+    public void move(float v){setVel(v,v);}
+    public void turnSpot(float v){setVel(v,-v);}
+    public void turnSharp(float v){if(v>0)setVel(v,0);else setVel(0,-v);}
+    public void turnSmooth(float v){if(v>0)setVel(v,v/2);else setVel(-v/2,-v);}
+    public void move(float v,int t){motionTimer.setMs(t);motionTimer.restart();while(motionTimer.getState()){move(v);}stop();}
+    public void teleoperate(char d,int v){switch(d){case 's':move(0);break;case 'f':move(+v);break;case 'b':move(-v);break;case 'r':turnSpot(+v/2);break;case 'l':turnSpot(-v/2);break;}}
 
-    /********************************************************************************************************************
-     *                                                   Motion::Methods                                                *
-     ********************************************************************************************************************/
-
-    public void forward() {
-        resetButtonsStyle();
-        btnForward.setStyle("-fx-background-color: #7FFF00; ");
-        dir = 'f';
-    }
-
-    public void backward() {
-        resetButtonsStyle();
-        btnBack.setStyle("-fx-background-color: #7FFF00; ");
-        dir = 'b';
-    }
-
-    public void left() {
-        resetButtonsStyle();
-        btnLeft.setStyle("-fx-background-color: #7FFF00; ");
-        dir = 'l';
-    }
-
-    public void right() {
-        resetButtonsStyle();
-        btnRight.setStyle("-fx-background-color: #7FFF00; ");
-        dir = 'r';
-    }
-
-    public void stop() {
-        resetButtonsStyle();
-        btnStop.setStyle("-fx-background-color: #7FFF00; ");
-        dir = 's';
-    }
-
-    private void resetButtonsStyle() {
-        btnRight.setStyle(defaultButtonStyle);
-        btnStop.setStyle(defaultButtonStyle);
-        btnLeft.setStyle(defaultButtonStyle);
-        btnForward.setStyle(defaultButtonStyle);
-        btnBack.setStyle(defaultButtonStyle);
-    }
-
-    public void setVel(float lVel, float rVel) {
-        vRep.simxSetJointTargetVelocity(clientID, leftWheelHandle.getValue(), lVel, remoteApi.simx_opmode_oneshot);
-        vRep.simxSetJointTargetVelocity(clientID, rightWheelHandle.getValue(), rVel, remoteApi.simx_opmode_oneshot);
-    }
-
-    public void move(float vel) {
-        setVel(vel, vel);
-    }
-
-    public void move(float vel, int time) {
-        motionTimer.setMs(time);
-        motionTimer.restart();
-        while (motionTimer.getState()) {
-            move(vel);
-        }
-        stop();
-    }
-
-    public void turnSpot(float vel) {
-        setVel(vel, -vel);
-    }
-
-    public void turnSpot(float vel, int time) {
-        motionTimer.setMs(time);
-        motionTimer.restart();
-        while (motionTimer.getState()) {
-            turnSpot(vel);
-        }
-        stop();
-    }
-
-    public void turnSharp(float vel) {
-        if (vel > 0) setVel(vel, 0);
-        else setVel(0, -vel);
-    }
-
-    public void turnSharp(float vel, int time) {
-        motionTimer.setMs(time);
-        motionTimer.restart();
-        while (motionTimer.getState()) {
-            turnSharp(vel);
-        }
-        stop();
-    }
-
-    public void turnSmooth(float vel) {
-        if (vel > 0) setVel(vel, vel / 2);
-        else setVel(-vel / 2, -vel);
-    }
-
-    public void turnSmooth(float vel, int time) {
-        motionTimer.setMs(time);
-        motionTimer.restart();
-        while (motionTimer.getState()) {
-            turnSmooth(vel);
-        }
-        stop();
-    }
-
-    public void teleoperate(char dir, int vel) {
-        switch (dir) {
-            case 's':
-                move(vel = 0);
-                break;
-            case 'f':
-                move(+vel);
-                break;
-            case 'b':
-                move(-vel);
-                break;
-            case 'r':
-                turnSpot(+vel / 2);
-                break;
-            case 'l':
-                turnSpot(-vel / 2);
-                break;
-        }
-    }
-
-
-    /********************************************************************************************************************
-     *                                                   Generic::Methods                                               *
-     ********************************************************************************************************************/
-
+    // ==========================================
+    //  Connection
+    // ==========================================
     public void connectToVrep() {
-        clientID = vRep.simxStart("127.0.0.1", 20001, true, true, 5000, 5);
-        if (clientID == -1) {
-            btnConnect.setText("Failed");
-            btnConnect.setStyle("-fx-background-color: #FF0000; ");
-            vRep.simxFinish(clientID);
-        } else {
-            btnConnect.setStyle("-fx-background-color: #7FFF00; ");
-            btnConnect.setText("Connected");
-            setup();
-        }
+        clientID=vRep.simxStart("127.0.0.1",20001,true,true,5000,5);
+        if(clientID==-1){btnConnect.setText("Failed");btnConnect.setStyle("-fx-background-color:#FF0000;");vRep.simxFinish(clientID);}
+        else{btnConnect.setStyle("-fx-background-color:#7FFF00;");btnConnect.setText("Connected");setup();}
     }
-
     public void setup() {
-        vRep.simxGetObjectHandle(clientID, "JointLeftWheel", leftWheelHandle, remoteApi.simx_opmode_blocking);
-        vRep.simxGetObjectHandle(clientID, "JointRightWheel", rightWheelHandle, remoteApi.simx_opmode_blocking);
-        vRep.simxGetObjectHandle(clientID, "Vision_sensor", cameraHandle, remoteApi.simx_opmode_blocking);
-
-        defaultButtonStyle = btnForward.getStyle();
-        pw = canvasCamera.getGraphicsContext2D().getPixelWriter();
-        ImageViewer.open(resolutionCamera, resolutionCamera, "Camera");
-
-        motionTimer.setSec(1);
-        batteryTimer.setSec(MAX_BATT_TIME);
-        wanderTimer.setSec(MAX_BATT_TIME);
-        motionTimer.start();
-        batteryTimer.start();
-        wanderTimer.start();
-
-        update.start();
-        main.start();
+        vRep.simxGetObjectHandle(clientID,"JointLeftWheel",leftWheelHandle,remoteApi.simx_opmode_blocking);
+        vRep.simxGetObjectHandle(clientID,"JointRightWheel",rightWheelHandle,remoteApi.simx_opmode_blocking);
+        vRep.simxGetObjectHandle(clientID,"Vision_sensor",cameraHandle,remoteApi.simx_opmode_blocking);
+        defaultButtonStyle=btnForward.getStyle();
+        pw=canvasCamera.getGraphicsContext2D().getPixelWriter();
+        ImageViewer.open(resolutionCamera,resolutionCamera,"Camera");
+        motionTimer.setSec(1); batteryTimer.setSec(MAX_BATT_TIME);
+        motionTimer.start(); batteryTimer.start();
+        update.start(); main.start();
     }
 
-
-    /**
-     * Method     : Controller::update()
-     * Purpose    : To update the robot sensors and GUI.
-     * Parameters : None.
-     * Returns    : Nothing.
-     * Notes      : Runs in its own thread. Reads sensors, updates GUI labels, calls update().
-     **/
+    // ==========================================
+    //  Sensor Update Thread
+    // ==========================================
     private Thread update = new Thread() {
         public void run() {
-            setBatteryTime(45);
-            while (true) {
-                // [1]Update robot:
-                if (runGPS) {
-                    gpsValues = readGPS();
-                }
-                if (runSensors) {
-                    sonarValues = readSonars();
-                }
-                if (runWheelEncoder) {
-                    encoderValues[0] = readLeftWheelEnc();
-                    encoderValues[1] = readRightWheelEnc();
-                }
-                if (runCamera) {
-                    imageCamera = readCamera();
-                }
-                if (runMotion) {
-                    teleoperate(dir, vel);
-                }
-                // Capture values for lambda:
-                final double[] _gps = gpsValues.clone();
-                final double[] _sonar = sonarValues.clone();
-                final double[] _enc = encoderValues.clone();
-                final String _behavior = currentBehavior;
-                final double _batt = getBatteryPercentage();
-                final int _battSec = getBatteryTime();
-                final double _dist = distanceTravelled;
-                final boolean _avoid = autonomousEnabled && _sonar.length >= 3 && shouldAvoid(_sonar[0], _sonar[1], _sonar[2]);
-                final boolean _track = autonomousEnabled && shouldTrack(_batt, getTargetMaxScore());
-                final boolean _clean = autonomousEnabled && shouldClean(_batt);
-                final int _avoidCnt = avoidActivations;
-                final int _trackCnt = trackActivations;
-                final int _cleanCnt = cleanActivations;
-                final int _wanderCnt = wanderActivations;
-                final boolean _docked = dockedAtCharger;
-                Platform.runLater(new Runnable() {
-                    public void run() {
-                        if (runGPS) {
-                            lblGpsX.setText("X: " + _gps[0]);
-                            lblGpsY.setText("Y: " + _gps[1]);
-                            lblGpsZ.setText("Z: " + _gps[2]);
-                        }
-                        if (runSensors) {
-                            lblSensor0.setText(Utils.getDecimal(_sonar[0], "0.00") + "m");
-                            lblSensor1.setText(Utils.getDecimal(_sonar[1], "0.00") + "m");
-                            lblSensor2.setText(Utils.getDecimal(_sonar[2], "0.00") + "m");
-                            lblSensor3.setText(Utils.getDecimal(_sonar[3], "0.00") + "m");
-                            lblSensor4.setText(Utils.getDecimal(_sonar[4], "0.00") + "m");
-                            lblSensor5.setText(Utils.getDecimal(_sonar[5], "0.00") + "m");
-                        }
-                        if (runWheelEncoder) {
-                            lblRightWheel.setText("Right: " + _enc[1]);
-                            lblLeftWheel.setText("Left: " + _enc[0]);
-                        }
-                        // Behaviour & battery status:
-                        if (lblBehavior != null) lblBehavior.setText(_behavior);
-                        if (lblBattery != null) lblBattery.setText("Battery: " + (int)_batt + "%");
-                        if (lblBatteryTime != null) lblBatteryTime.setText("Time: " + _battSec + "s");
-                        if (lblDistance != null) lblDistance.setText("Distance: " + Utils.getDecimal(_dist, "0.00") + "m");
-                        if (lblCharging != null) lblCharging.setText(_docked ? "CHARGING" : "");
-                        if (lblBatteryRate != null) lblBatteryRate.setText("Rate: " + (int)batteryDrainRate + "x");
-                        // TLU status:
-                        if (lblTluAvoid != null) lblTluAvoid.setText("Avoid TLU: " + (_avoid ? "+1" : "-1"));
-                        if (lblTluTrack != null) lblTluTrack.setText("Track TLU: " + (_track ? "+1" : "-1"));
-                        if (lblTluClean != null) lblTluClean.setText("Clean TLU: " + (_clean ? "+1" : "-1"));
-                        if (lblTluWander != null) lblTluWander.setText("Wander TLU: +1");
-                        // Behaviour activation counts:
-                        if (lblAvoidCount != null) lblAvoidCount.setText("Avoid: " + _avoidCnt);
-                        if (lblTrackCount != null) lblTrackCount.setText("Track: " + _trackCnt);
-                        if (lblCleanCount != null) lblCleanCount.setText("Clean: " + _cleanCnt);
-                        if (lblWanderCount != null) lblWanderCount.setText("Wander: " + _wanderCnt);
-                    }
+            while(!simulationComplete) {
+                if(runGPS)          gpsValues    = readGPS();
+                if(runSensors)      sonarValues  = readSonars();
+                if(runWheelEncoder){encoderValues[0]=readLeftWheelEnc();encoderValues[1]=readRightWheelEnc();}
+                if(runCamera)       imageCamera  = readCamera();
+                if(runMotion)       teleoperate(dir,vel);
+                final double[] _g=gpsValues.clone(),_s=sonarValues.clone(),_e=encoderValues.clone();
+                final double _b=getBatteryPercentage(); final int _bs=getBatteryTime();
+                final double _d=distanceTravelled; final String _bh=activeBehaviour;
+                Platform.runLater(()->{
+                    if(runGPS){lblGpsX.setText("X:"+_g[0]);lblGpsY.setText("Y:"+_g[1]);lblGpsZ.setText("Z:"+_g[2]);}
+                    if(runSensors){lblSensor0.setText(Utils.getDecimal(_s[0],"0.00")+"m");lblSensor1.setText(Utils.getDecimal(_s[1],"0.00")+"m");lblSensor2.setText(Utils.getDecimal(_s[2],"0.00")+"m");lblSensor3.setText(Utils.getDecimal(_s[3],"0.00")+"m");lblSensor4.setText(Utils.getDecimal(_s[4],"0.00")+"m");lblSensor5.setText(Utils.getDecimal(_s[5],"0.00")+"m");}
+                    if(runWheelEncoder){lblRightWheel.setText("Right:"+_e[1]);lblLeftWheel.setText("Left:"+_e[0]);}
+                    if(lblBattery!=null)lblBattery.setText(String.format("Battery:%.1f%%",_b));
+                    if(lblBatteryTime!=null)lblBatteryTime.setText(String.format("Time:%ds",_bs));
+                    if(lblBehavior!=null)lblBehavior.setText(_bh);
+                    if(lblDistance!=null)lblDistance.setText(String.format("Distance:%.2fm",_d));
                 });
-
-                // [2]Update custom code:
                 update();
-
-                // [3]Update battery:
-                if (!getBatteryState()) {
-                    System.err.println("Error: Robot out of battery...");
-                    move(0, 1000);
-                    running = false;
-                    break;
-                }
+                if(!getBatteryState()){System.err.println("Error: Robot out of battery...");move(0,1000);running=false;break;}
                 Delay.ms(1);
             }
         }
     };
+    private Thread main=new Thread(){public void run(){while(!simulationComplete){main();Delay.ms(1);}}};
 
-    /**
-     * Method     : Controller::main()
-     * Purpose    : To run the main control loop.
-     * Parameters : None.
-     * Returns    : Nothing.
-     * Notes      : Runs in its own thread. Calls main() which calls run() (subsumption coordinator).
-     **/
-    private Thread main = new Thread() {
-        public void run() {
-            while (true) {
-                main();
-                Delay.ms(1);
-            }
-        }
-    };
+    // =========================================================================
+    //                          S T U D E N T   C O D E
+    //
+    //  Subsumption: AVOID(P1) > TRACK(P2) > CLEAN(P3) > WANDER(P4)
+    //  TLU: y = +1 if Σ(w·s) > f,  y = -1 otherwise
+    //  Sensors normalised [0,1] before TLU.
+    // =========================================================================
 
+    // ── TLU weights ──────────────────────────────────────────────────────────
+    private static final double[] AVOID_W  = {0.5,0.6,0.5};
+    private static final double   AVOID_F  = 0.15;
+    // AVOID_RANGE = 0.25m: fires only when obstacles are within 25 cm.
+    // Must be < WALL_MARGIN (0.30m) so the end wall does not fire AVOID
+    // before the robot reaches its lane-end waypoint.
+    // Geometry: AVOID fires at x = 2.15 - 0.25 = 1.90m, waypoint is at
+    // x = 2.15 - 0.30 = 1.85m  →  robot reaches WP at 1.85 before AVOID
+    // fires at 1.90. 25cm is still enough to stop before hitting a wall.
+    private static final double   AVOID_RANGE = 0.25;
 
-    /********************************************************************************************************************
-     *                                                                                                                  *
-     *                                              STUDENT CODE                                                        *
-     *                                                                                                                  *
-     *  Implements a Subsumption Architecture with 4 behaviours:                                                        *
-     *    1. AVOID  (Priority 1 - Highest) : Wall/obstacle avoidance using front ultrasonic sensors                     *
-    *    2. TRACK  (Priority 2)           : Camera-guided charger tracking when battery <= 20% and target is detected  *
-     *    3. CLEAN  (Priority 3)           : Systematic lawn-mower room coverage using GPS waypoints                    *
-    *    4. WANDER (Priority 4 - Lowest)  : Random manoeuvres at scheduled intervals as fallback behaviour            *
-     *                                                                                                                  *
-     *  Each behaviour uses a TLU (Threshold Logic Unit) for activation decisions.                                      *
-     *  Navigation uses GPS-based heading estimation with proportional steering control.                                *
-     *  Only FRONT sensors (0, 1, 2) are used to avoid false detections from wide-angle side sensors.                   *
-     *                                                                                                                  *
-     ********************************************************************************************************************/
+    private static final double[] TRACK_W       = {0.6,0.8};
+    private static final double   TRACK_F       = 1.0;
+    private static final double   TRACK_BATT_PCT= 20.0;
+    private static final double   TRACK_CAM_SCORE=0.55;
 
-    // ==================== BEHAVIOURAL CONSTANTS ====================
+    private static final double[] CLEAN_W       = {1.0};
+    private static final double   CLEAN_F       = 0.5;
+    private static final double   CLEAN_BATT_PCT= 40.0;
 
-    /** Room boundary coordinates (meters). Per assignment specification, room corners are at ±2.15m. */
-    private static final double ROOM_MIN_X = -2.15;
-    private static final double ROOM_MAX_X =  2.15;
-    private static final double ROOM_MIN_Y = -2.15;
-    private static final double ROOM_MAX_Y =  2.15;
+    private static final double[] WANDER_W = {1.0};
+    private static final double   WANDER_F = 0.0;
 
-    /** Distance between parallel cleaning lanes in the lawn-mower pattern (meters).
-     *  0.35 m balances coverage density against number of 180° lane-end turns needed. */
+    // ── Robot dimensions ──────────────────────────────────────────────────────
+    private static final float  DRIVE_SPEED  = 3.0f;
+    private static final float  TURN_SPEED   = 2.0f;
+    private static final double WHEEL_RADIUS = 0.072;
+    private static final double WHEEL_BASE   = 0.331;
+
+    // ── Room & waypoints ──────────────────────────────────────────────────────
+    //  Hard constraint:  WALL_MARGIN > AVOID_RANGE > WP_REACH_RADIUS
+    //  Current values:   0.30        > 0.25        > 0.22          ✓
+    //
+    //  WALL_MARGIN = 0.30m → waypoints at ±1.85m (30cm from ±2.15 walls).
+    //  Robot stops cleaning 30cm from the wall — close enough to look good,
+    //  far enough that the front sonar (AVOID_RANGE=0.25m) never fires for
+    //  the end wall before the waypoint is registered.
+    //
+    //  Why both must change together:
+    //    AVOID fires when front sensor reads < AVOID_RANGE.
+    //    End wall is at 2.15m, so AVOID fires when robot is at x > 1.90m.
+    //    Lane-end waypoint is at x = 1.85m.  1.85 < 1.90  →  robot reaches
+    //    waypoint before AVOID fires  ✓
+    private static final double WALL_MARGIN = 0.30;
+    private static final double CLEAN_MIN_X = -2.15 + WALL_MARGIN;   // -1.85
+    private static final double CLEAN_MAX_X =  2.15 - WALL_MARGIN;   // +1.85
+    private static final double CLEAN_MIN_Y = -2.15 + WALL_MARGIN;   // -1.85
+    private static final double CLEAN_MAX_Y =  2.15 - WALL_MARGIN;   // +1.85
     private static final double LANE_SPACING = 0.35;
 
-    /** Distance threshold to consider a waypoint reached (meters).
-     *  Increased from 0.25 to 0.40 so robot can "pass through" waypoints
-     *  even after being deflected slightly by AVOID behavior. */
-    private static final double WAYPOINT_TOLERANCE = 0.40;
-
-    /** Minimum GPS movement required to update heading estimate (meters). Prevents noise from small GPS changes. */
-    private static final double HEADING_MIN_MOVEMENT = 0.03;
-
-    /** Distance from charger to consider docked (meters). */
-    private static final double CHARGER_DOCK_RADIUS = 0.30;
-
-    /** Coverage grid resolution (meters) for area-visited metric. */
-    private static final double COVERAGE_RES = 0.20;
-
-    /** Normal driving speed for cleaning and tracking (rad/s for wheel joints). */
-    private static final float DRIVE_SPEED = 3.0f;
-
-    /** Speed used during obstacle avoidance (rad/s). Slightly slower for safety but maintains forward progress. */
-    private static final float AVOID_DRIVE_SPEED = 2.5f;
-
-    /** Proportional gain for GPS-based steering correction.
-     *  Reduced to 1.0: together with the steer clamp, this gives arc-based correction
-     *  without any wheel going backward. At DRIVE_SPEED=3.0 and a 45° error,
-     *  steer=0.79 with effectiveSpeed=2.12, keeping both wheels firmly forward. */
-    private static final double STEERING_GAIN = 1.0;
-
-    /** Proportional gain for reactive obstacle avoidance steering. */
-    private static final double AVOID_STEER_GAIN = 2.0;
-
-    /** Maximum sonar range at which obstacles trigger avoidance (meters).
-     *  Obstacles beyond this distance are ignored. This prevents the TLU from
-     *  firing when the robot is still far from actual obstructions (e.g. 0.5-0.7m
-     *  from a wall). Only obstacles within AVOID_RANGE contribute to the TLU sum. */
-    private static final double AVOID_RANGE = 0.45;
-
-    /** Safety margin from room walls for cleaning waypoints (meters).
-     *  Waypoints are inset by this amount so the cleaning path stays INSIDE
-     *  the AVOID trigger zone. AVOID fires at ~0.45m from walls, so waypoints
-     *  at ±1.65 are safely reachable without AVOID interference at lane ends. */
-    private static final double WALL_MARGIN = 0.50;
-
-    /** Cleaning area boundaries (inset by WALL_MARGIN). Used for coverage grid origin
-     *  so that only accessible cells are counted toward coverage percentage. */
-    private static final double CLEAN_MIN_X = ROOM_MIN_X + WALL_MARGIN;
-    private static final double CLEAN_MIN_Y = ROOM_MIN_Y + WALL_MARGIN;
-    private static final double CLEAN_MAX_X = ROOM_MAX_X - WALL_MARGIN;
-    private static final double CLEAN_MAX_Y = ROOM_MAX_Y - WALL_MARGIN;
-
-    /** Spacing of intermediate waypoints along each cleaning lane (meters).
-     *  0.50 m keeps WPs achievable at driving speed without excessive waypoint count. */
-    private static final double WP_ALONG_LANE_SPACING = 0.50;
-
-    // ==================== AVOID TLU PARAMETERS ====================
-    /** TLU weights for avoid behaviour. Inputs are range-gated proximity values for sensors 0, 1, 2.
-     *  Centre sensor (1) is weighted higher because head-on collisions are more critical. */
-    private static final double[] AVOID_WEIGHTS   = {0.5, 0.6, 0.5};
-    /** TLU threshold for avoid behaviour. Tuned with range-gated proximity so avoidance
-     *  triggers when obstacles are within ~0.35m (single sensor) or ~0.40m (multiple sensors). */
-    private static final double   AVOID_THRESHOLD = 0.18;
-
-    // ==================== TRACK TLU PARAMETERS ====================
-    /** TLU weights for track behaviour.
-     *  Sensors: [lowBattery, visualTargetDetected].
-     *  TRACK fires only when both low battery and charger marker are visually detected. */
-    private static final double[] TRACK_WEIGHTS   = {0.6, 0.8};
-    /** TLU threshold for track behaviour. Requires low battery + visual detection. */
-    private static final double   TRACK_THRESHOLD = 1.0;
-
-    /** Assignment-compliant battery threshold for TRACK activation (<= 20%). */
-    private static final double TRACK_BATT_TRIGGER_PCT = 20.0;
-
-    /** Minimum template-matching score to consider charger marker visually detected. */
-    private static final double TRACK_VISUAL_SCORE_THRESHOLD = 0.55;
-
-    /** Steering gain for camera-based visual servoing during TRACK. */
-    private static final double TRACK_CAMERA_STEER_GAIN = 1.8;
-
-    /** Slow scan turn speed when TRACK is active but charger marker is temporarily lost. */
-    private static final float TRACK_SEARCH_SPIN_SPEED = 1.0f;
-
-    // ==================== CLEAN TLU PARAMETERS ====================
-    /** TLU weight for clean behaviour. Input is 1.0 for battery in 40-100% range. */
-    private static final double[] CLEAN_WEIGHTS   = {1.0};
-    /** TLU threshold for clean behaviour. Fires when battery is sufficient for cleaning. */
-    private static final double   CLEAN_THRESHOLD = 0.5;
-
-    /** Assignment-compliant minimum battery threshold for CLEAN activation (>= 40%). */
-    private static final double CLEAN_BATT_MIN_PCT = 40.0;
-
-
-    // ==================== ENCODER DEAD-RECKONING CONSTANTS ====================
-
-    /** Wheel base (distance between left and right wheels) in metres.
-     *  Must be measured from the CoppeliaSim model joint positions. */
-    private static final double WHEEL_BASE = 0.331;
-
-    /** Wheel radius in metres. Must be measured from the CoppeliaSim model wheel object. */
-    private static final double WHEEL_RADIUS = 0.072;
-
-    /** GPS heading correction factor (0 = never correct, 1 = raw overwrite).
-     *  With encoder dead-reckoning as the primary heading source, GPS serves only
-     *  as a drift corrector. 0.30 means each GPS update nudges heading by 30%,
-     *  correcting encoder drift before it accumulates into spinning. */
-    private static final double HEADING_ALPHA = 0.30;
-
-    /** Number of ticks to keep heading frozen after an AVOID manoeuvre ends.
-     *  This prevents the corrupted AVOID heading from leaking into navigation. */
-    private static final int AVOID_SETTLE_TICKS = 30;
-
-    /** Spin-in-place speed for heading alignment in CLEAN behaviour (rad/s).
-     *  2.5 rad/s completes a 180° lane-end turn in ~2.5 s — much faster than 1.5. */
-    private static final float SPIN_SPEED = 2.5f;
-
-    /** Heading error below which the robot is considered aligned (radians). 12°. */
-    private static final double TURN_ALIGNED_THRESHOLD = Math.toRadians(12);
-
-    /** Heading error that triggers an explicit spin-in-place (radians). 90°.
-     *  Only errors > 90° require a dedicated spin (e.g. lane-end 180° reversals).
-     *  Errors below 90° are handled smoothly by the P-controller arc steering,
-     *  which avoids the spin-loop trap caused by a lower threshold and encoder drift. */
-    private static final double TURN_TRIGGER_THRESHOLD = Math.toRadians(90);
-
-    /** Maximum ticks for a spin-in-place before driving forward anyway. */
-    private static final int MAX_TURN_TICKS = 200;
-
-
-    // ==================== CLEAN STATE MACHINE ====================
-
-    /** States for the CLEAN behaviour. */
-    private enum CleanState { NAVIGATE_TO_WP, TURNING_TO_WP }
-    private CleanState cleanState = CleanState.NAVIGATE_TO_WP;
-    /** Tick counter used ONLY in TURNING_TO_WP state. */
-    private int turnTickCount = 0;
-    /** Navigate-only ticks on the current waypoint (turning ticks NOT counted).
-     *  Ensures the stuck timer accurately reflects forward-progress time. */
-    private int wpStuckCounter = 0;
-    /** Maximum navigate ticks before skipping an unreachable WP (~21 s at 24 Hz). */
-    private static final int MAX_WP_STUCK_TICKS = 500;
-
-
-    // ==================== STATE VARIABLES ====================
-
-    /** Whether autonomous mode has been enabled via the GUI button. False until user clicks "Auto Mode". */
-    private boolean autonomousEnabled = false;
-
-    /** Whether autonomous mode has been initialized. */
-    private boolean autoInitialized = false;
-
-    /** Charging state: true after docking; experiment ends after charge duration. */
-    private boolean chargingComplete = false;
-    private long chargeStartMs = 0;
-
-    /** Battery percentage at the moment docking began. */
-    private double chargeStartBattPct = 0.0;
-    /** When >= 0, overrides getBatteryPercentage() during charging. Set to -1 when not charging. */
-    private double chargingOverridePct = -1.0;
-    private static final long CHARGE_DURATION_MS = 10000; // 10 seconds simulated charge
-
-    /** Previous GPS coordinates for heading estimation. NaN means not yet initialized. */
-    private double lastGpsX = Double.NaN;
-    private double lastGpsY = Double.NaN;
-
-    /** Estimated robot heading in radians (fused GPS + encoder). 0 = positive X direction. */
-    private double robotHeading = 0.0;
-
-    /** Whether we have a valid heading estimate (requires initial movement). */
-    private boolean headingKnown = false;
-
-    /** When true, heading estimation is frozen to prevent AVOID manoeuvres from
-     *  corrupting the heading used by CLEAN/TRACK navigation. */
-    private boolean headingFrozen = false;
-
-    /** Countdown ticks after AVOID ends before heading is unfrozen.
-     *  Allows the robot to resume straight-line motion before heading updates resume. */
-    private int avoidSettleCounter = 0;
-
-    /** Previous raw joint angles for encoder dead-reckoning (radians).
-     *  Uses raw CoppeliaSim joint position, not cumulative revolutions,
-     *  to handle backward rotation and ±π boundary correctly. */
-    private double leftJointPrev = Double.NaN;
-    private double rightJointPrev = Double.NaN;
-
-    /** Whether the cleaning pattern has been started (first executeClean call performs nearest-WP search). */
-    private boolean cleanPatternStarted = false;
-
-    /** Cumulative count of waypoints reached (persists across pattern restarts). */
-    private int totalWaypointsReached = 0;
-
-    /** Pre-computed waypoints for the lawn-mower cleaning pattern. Each entry is {x, y}. */
-    private double[][] cleaningWaypoints;
-
-    /** Index of the current target waypoint in the cleaning pattern. */
-    private int currentWaypointIdx = 0;
-
-    /** Whether the robot has successfully docked at the charging station. */
-    private boolean dockedAtCharger = false;
-
-    /** Grid-based coverage map for visited cells. */
-    private boolean[][] coverageGrid;
-    private int coverageRows = 0;
-    private int coverageCols = 0;
-    private int coverageVisitedCount = 0;
-
-    /** Name of the currently active behaviour (for logging and display). */
-    private String currentBehavior = "INIT";
-
-    /** Loop counter for throttled status printing. */
-    private int loopCounter = 0;
-
-    /** Print status to console every N ticks. At ~24 Hz tick rate, 1500 ≈ every 63 seconds. */
-    private static final int STATUS_PRINT_INTERVAL = 1500;
-
-    // ==================== WANDER TIMING (SCHEDULED INTERVALS) ====================
-
-    /** Seconds between scheduled random manoeuvres during WANDER. */
-    private static final int WANDER_INTERVAL_SEC = 4;
-
-    /** Duration (seconds) of each scheduled random manoeuvre. */
-    private static final int WANDER_TURN_DURATION_SEC = 2;
-
-    /** Maximum steering magnitude applied during random manoeuvres. */
-    private static final double WANDER_MAX_STEER = 1.2;
-
-    /** Next second at which a random manoeuvre should start. */
-    private int nextWanderTurnSec = -1;
-
-    /** End second for the currently active random manoeuvre (-1 means inactive). */
-    private int wanderTurnEndSec = -1;
-
-    /** Current steering command used during a scheduled random manoeuvre. */
-    private double wanderSteerCmd = 0.0;
-
-
-    // ==================== METRICS & DATA COLLECTION ====================
-
-    /** Total distance travelled estimated from GPS heading updates (meters). */
-    private double distanceTravelled = 0.0;
-
-    /** Count of how many ticks each behaviour was active. */
-    private int avoidActivations = 0;
-    private int trackActivations = 0;
-    private int cleanActivations = 0;
-    private int wanderActivations = 0;
-
-    /** Collected experiment data rows for CSV export. */
-    private List<String> dataLog = new ArrayList<>();
-
-    /** Timestamp of when the autonomous run started (ms). */
-    private long experimentStartMs = 0;
-
-    /** Whether experiment data has been exported (to prevent duplicate writes). */
-    private boolean experimentExported = false;
-
-
-    /********************************************************************************************************************
-     *                                          TLU (Threshold Logic Unit)                                              *
-     *                                                                                                                  *
-     *  The TLU takes a sensor vector s and a weight vector w. It computes the weighted sum                             *
-     *  and compares it against threshold f:                                                                            *
-     *    y = +1 (true)  if  Σ(w_i × s_i) > f                                                                         *
-     *    y = -1 (false) otherwise                                                                                      *
-     *  The weights and thresholds are set by intuition and tuned by trial and error.                                   *
-     ********************************************************************************************************************/
-
-    /**
-     * Method     : Controller::tlu()
-     * Purpose    : Implements a Threshold Logic Unit for behaviour activation.
-     * Parameters : - w_vec : Weight vector (one weight per sensor input).
-     *              - s_vec : Sensor vector (normalised sensor readings).
-     *              - f     : Activation threshold.
-     * Returns    : True (+1) if TLU fires, False (-1) otherwise.
-     * Notes      : Core decision mechanism for the subsumption architecture.
-     **/
-    public boolean tlu(double w_vec[], double s_vec[], double f) {
-        double sum = 0.0;
-        for (int i = 0; i < w_vec.length && i < s_vec.length; i++) {
-            sum += w_vec[i] * s_vec[i];
-        }
-        return (sum > f);
-    }
-
-
-    /********************************************************************************************************************
-     *                                         Heading Estimation (from GPS)                                            *
-     *                                                                                                                  *
-     *  Since the robot has no compass, heading is estimated from consecutive GPS readings.                             *
-     *  The heading is only updated when the robot has moved more than HEADING_MIN_MOVEMENT                             *
-     *  to avoid noise from GPS rounding (GPS rounds to 2 decimal places = ±0.005m).                                   *
-     ********************************************************************************************************************/
-
-    /**
-     * Method     : Controller::estimateHeadingFromGPS()
-     * Purpose    : Updates the robot heading estimate from GPS position changes.
-     *              Uses an exponential low-pass filter (HEADING_ALPHA) to smooth
-     *              noisy GPS deltas, and respects the headingFrozen flag to prevent
-     *              AVOID manoeuvres from corrupting the navigation heading.
-     * Parameters : gpsX, gpsY - current GPS coordinates.
-     * Returns    : Nothing. Updates robotHeading and headingKnown fields.
-     **/
-    private void estimateHeadingFromGPS(double gpsX, double gpsY) {
-        // Guard against garbage GPS values from uninitialized V-REP streaming buffer
-        if (Math.abs(gpsX) > 100.0 || Math.abs(gpsY) > 100.0) return;
-
-        if (Double.isNaN(lastGpsX)) {
-            lastGpsX = gpsX;
-            lastGpsY = gpsY;
-            return;
-        }
-
-        double dx = gpsX - lastGpsX;
-        double dy = gpsY - lastGpsY;
-        double dist = Math.hypot(dx, dy);
-
-        // Reject implausibly large jumps (GPS glitch or V-REP init artifact)
-        if (dist > 5.0) {
-            lastGpsX = gpsX;
-            lastGpsY = gpsY;
-            return;
-        }
-
-        if (dist < HEADING_MIN_MOVEMENT) return;
-
-        // Always update distance and baseline position
-        lastGpsX = gpsX;
-        lastGpsY = gpsY;
-        distanceTravelled += dist;
-
-        // GPS serves as a CORRECTION to encoder-based heading, not primary source.
-        // Only apply when heading is not frozen (i.e. not during or just after AVOID).
-        if (!headingFrozen) {
-            double gpsHeading = Math.atan2(dy, dx);
-
-            if (!headingKnown) {
-                // First valid heading — accept GPS value immediately
-                robotHeading = gpsHeading;
-                headingKnown = true;
-            } else {
-                // Small correction factor: encoder leads, GPS gently nudges toward truth
-                // HEADING_ALPHA = 0.08 → only 8% weight to GPS per update
-                double err = normalizeAngle(gpsHeading - robotHeading);
-                robotHeading = normalizeAngle(robotHeading + HEADING_ALPHA * err);
-            }
-        }
+    private static final double WP_REACH_RADIUS       = 0.22;                     // metres — < LANE_SPACING/2 to prevent skipping
+    private static final double HEADING_TURN_THRESHOLD = Math.toRadians(25.0);    // radians
+
+    // =========================================================================
+    //  HYBRID HEADING ESTIMATOR
+    //
+    //  PRIMARY  — Encoder differential integration:
+    //    dθ = (dR - dL) / WHEEL_BASE
+    //    dL, dR = arc-length deltas from encoder revolution deltas.
+    //    Updates every tick, works during spinning AND translating.
+    //    Sign: dR > dL → turned left → heading increases (CCW positive, 0 = +X).
+    //
+    //  SECONDARY — GPS calibration:
+    //    When GPS has moved ≥ GPS_CALIB_DIST since last calibration point,
+    //    snap headingEst to the GPS movement bearing.
+    //    Eliminates accumulated encoder drift.
+    //
+    //  Why deadlock is impossible:
+    //    During spinning, encoder integration changes headingEst each tick.
+    //    After rotating ~headingError radians the error drops below
+    //    HEADING_TURN_THRESHOLD and the robot starts translating forward.
+    //    First forward movement triggers GPS calibration → drift cleared.
+    // =========================================================================
+    private static final double GPS_CALIB_DIST = 0.05;   // metres before GPS recalibrates heading
+
+    private double  headingEst   = 0.0;     // current heading estimate (rad, 0 = facing +X)
+
+    // Encoder state
+    private double  encHL_prev  = 0.0, encHR_prev = 0.0;
+    private boolean encHInit    = false;
+
+    // GPS calibration state
+    private double  gpsCalibX   = Double.NaN;
+    private double  gpsCalibY   = Double.NaN;
+
+    private double normAngle(double a) {
+        while(a> Math.PI) a-=2*Math.PI;
+        while(a<-Math.PI) a+=2*Math.PI;
+        return a;
     }
 
     /**
-     * Method     : Controller::updateHeadingFromEncoders()
-     * Purpose    : Supplements GPS heading estimation with wheel-encoder dead-reckoning.
-     *              Encoders provide smooth, lag-free heading updates during slow turns
-     *              and pivots where GPS deltas are too small to be useful.
-     * Parameters : leftEnc, rightEnc - current wheel encoder readings (revolutions).
-     * Returns    : Nothing. Updates robotHeading from encoder deltas.
-     * Notes      : The encoder change dθ = (dRight − dLeft) / WHEEL_BASE gives the
-     *              change in heading. This is applied every tick regardless of
-     *              headingFrozen, because encoders directly measure wheel rotation
-     *              and don't suffer the same corruption problem as GPS during AVOID.
-     *              However, during headingFrozen we only apply encoder heading if
-     *              the robot is purposefully spinning (TURNING_TO_WP state).
-     **/
-    private void updateHeadingFromEncoders(double leftJoint, double rightJoint) {
-        if (Double.isNaN(leftJointPrev)) {
-            leftJointPrev = leftJoint;
-            rightJointPrev = rightJoint;
-            return;
-        }
-
-        // CoppeliaSim returns absolute joint angle in radians.
-        // Compute signed angular delta with ±π wrapping to handle backward rotation
-        // and the ±π boundary correctly.
-        double dLeft  = normalizeAngle(leftJoint  - leftJointPrev);
-        double dRight = normalizeAngle(rightJoint - rightJointPrev);
-
-        leftJointPrev  = leftJoint;
-        rightJointPrev = rightJoint;
-
-        // Convert joint-angle delta (radians) to linear distance (metres)
-        double distLeft  = dLeft  * WHEEL_RADIUS;
-        double distRight = dRight * WHEEL_RADIUS;
-
-        // Differential drive heading update: Δθ = (distRight − distLeft) / wheelBase
-        double dTheta = (distRight - distLeft) / WHEEL_BASE;
-
-        // Encoders are the PRIMARY heading source — always integrate.
-        // (GPS only applies a small correction via HEADING_ALPHA = 0.08)
-        robotHeading = normalizeAngle(robotHeading + dTheta);
-
-        if ((Math.abs(dLeft) + Math.abs(dRight)) > 0.0001) {
-            headingKnown = true;
-        }
-    }
-
-    /**
-     * Method     : Controller::normalizeAngle()
-     * Purpose    : Normalises an angle to the range [-π, +π].
-     * Parameters : angle - the angle in radians.
-     * Returns    : The normalised angle.
-     **/
-    private double normalizeAngle(double angle) {
-        while (angle >  Math.PI) angle -= 2 * Math.PI;
-        while (angle < -Math.PI) angle += 2 * Math.PI;
-        return angle;
-    }
-
-    /** Marks the coverage grid cell for the given GPS position.
-     *  Grid origin is at (CLEAN_MIN_X, CLEAN_MIN_Y) so only accessible cleaning
-     *  area cells are tracked — wall-margin cells are excluded from coverage %. */
-    private void markCoverage(double gpsX, double gpsY) {
-        if (coverageGrid == null) return;
-        int col = (int)Math.floor((gpsX - CLEAN_MIN_X) / COVERAGE_RES);
-        int row = (int)Math.floor((gpsY - CLEAN_MIN_Y) / COVERAGE_RES);
-        if (row < 0 || col < 0 || row >= coverageRows || col >= coverageCols) return;
-        if (!coverageGrid[row][col]) {
-            coverageGrid[row][col] = true;
-            coverageVisitedCount++;
-        }
-    }
-
-    /** Returns coverage percent (0-100) of visited cells. */
-    private double getCoveragePercent() {
-        if (coverageGrid == null || coverageRows == 0 || coverageCols == 0) return 0.0;
-        int total = coverageRows * coverageCols;
-        if (total == 0) return 0.0;
-        return (100.0 * coverageVisitedCount) / total;
-    }
-
-
-    /********************************************************************************************************************
-     *                                     Waypoint Generation (Lawn-Mower Pattern)                                     *
-     *                                                                                                                  *
-     *  Generates a boustrophedon (zigzag) path covering the room:                                                     *
-     *    Lane 0: left boundary → right boundary (at y = ROOM_MIN_Y)                                                   *
-     *    Lane 1: right boundary → left boundary (at y = ROOM_MIN_Y + LANE_SPACING)                                    *
-     *    Lane 2: left → right (at y = ROOM_MIN_Y + 2 × LANE_SPACING)                                                 *
-     *    ... and so on until the top boundary.                                                                         *
-     *  This ensures systematic coverage of the entire room area.                                                       *
-     ********************************************************************************************************************/
-
-    /**
-     * Method     : Controller::initCleaningWaypoints()
-     * Purpose    : Pre-computes a flat boustrophedon (lawn-mower) waypoint list covering
-     *              the entire cleaning area. Lanes run parallel to the X axis, alternating
-     *              direction row by row from bottom (y=CLEAN_MIN_Y) to top (y=CLEAN_MAX_Y).
-     *              The robot navigates this flat list sequentially: WP 0 → 1 → … → N-1,
-     *              then restarts. On first call, it starts from the waypoint nearest to
-     *              its current GPS position.
-     * Returns    : Nothing. Sets cleaningWaypoints array and coverage grid.
-     **/
-    private void initCleaningWaypoints() {
-        // Q1 ONLY: bottom-right quadrant (x: 0..+1.65, y: -1.65..0).
-        // This is the quadrant nearest to the charger spawn point, so the robot
-        // starts here and systematically covers it before battery drops.
-        // Keeping the area small avoids long initial sprints and large heading errors.
-        double xMin = 0.0;          // Q1 left boundary (room centre)
-        double xMax = CLEAN_MAX_X;  // +1.65
-        double yMin = CLEAN_MIN_Y;  // -1.65
-        double yMax = 0.0;          // Q1 top boundary (room centre)
-
-        List<double[]> wps = new ArrayList<>();
-        boolean leftToRight = true;  // Lane 0 goes left→right (x: 0 → +1.65)
-
-        for (double laneY = yMin; laneY <= yMax + 0.001; laneY += LANE_SPACING) {
-            double clampedY = Math.min(laneY, yMax);
-            double startX   = leftToRight ? xMin : xMax;
-            double dir      = leftToRight ? 1.0 : -1.0;
-            double laneDist = xMax - xMin;
-            int steps = (int) Math.ceil(laneDist / WP_ALONG_LANE_SPACING);
-
-            for (int i = 0; i <= steps; i++) {
-                double x = startX + dir * Math.min(i * WP_ALONG_LANE_SPACING, laneDist);
-                wps.add(new double[]{x, clampedY});
-            }
-            leftToRight = !leftToRight;
-        }
-
-        cleaningWaypoints = wps.toArray(new double[0][]);
-        int numLanes = (int) Math.ceil((yMax - yMin) / LANE_SPACING) + 1;
-        System.out.printf("[CLEAN] Q1 ONLY: %d waypoints across %d lanes  lane=%.2fm  wp=%.2fm%n",
-                cleaningWaypoints.length, numLanes, LANE_SPACING, WP_ALONG_LANE_SPACING);
-        System.out.printf("[CLEAN] Q1 bounds: x=[%.2f..%.2f]  y=[%.2f..%.2f]%n",
-                xMin, xMax, yMin, yMax);
-
-        // Build coverage grid (full room for overall coverage reporting)
-        coverageCols = (int) Math.ceil((CLEAN_MAX_X - CLEAN_MIN_X) / COVERAGE_RES);
-        coverageRows = (int) Math.ceil((CLEAN_MAX_Y - CLEAN_MIN_Y) / COVERAGE_RES);
-        coverageGrid = new boolean[coverageRows][coverageCols];
-        coverageVisitedCount = 0;
-    }
-
-
-    /********************************************************************************************************************
-     *                                      GPS Navigation (Proportional Steering)                                      *
-     *                                                                                                                  *
-     *  Steers the robot toward a target point using proportional control:                                              *
-     *    1. Compute desired heading = atan2(targetY - gpsY, targetX - gpsX)                                           *
-     *    2. Compute heading error = desired - current (normalised to [-π, π])                                          *
-     *    3. Apply steering: steer = -Kp × error                                                                       *
-     *       (negative because positive error = target left, but leftVel > rightVel = turn right)                       *
-     *    4. Set wheel velocities: left = speed + steer, right = speed - steer                                         *
-     *                                                                                                                  *
-     *  If heading is not yet known (robot hasn't moved enough), drives straight to establish heading.                  *
-     ********************************************************************************************************************/
-
-    /**
-     * Method     : Controller::steerTowardPoint()
-     * Purpose    : Navigates the robot toward a target GPS coordinate using proportional steering.
-     * Parameters : targetX, targetY - destination coordinates.
-     *              gpsX, gpsY       - current robot position.
-     *              speed            - base driving speed (rad/s).
-     * Returns    : True if the robot has arrived at the target (within WAYPOINT_TOLERANCE), false otherwise.
-     **/
-    private boolean steerTowardPoint(double targetX, double targetY, double gpsX, double gpsY, float speed) {
-        double dx = targetX - gpsX;
-        double dy = targetY - gpsY;
-        double dist = Math.sqrt(dx * dx + dy * dy);
-
-        // Check if arrived at target
-        if (dist < WAYPOINT_TOLERANCE) {
-            return true;
-        }
-
-        // If heading not yet established, drive straight forward to build up GPS delta
-        if (!headingKnown) {
-            setVel(speed, speed);
-            return false;
-        }
-
-        // Compute desired heading toward target
-        double desiredHeading = Math.atan2(dy, dx);
-        double error = normalizeAngle(desiredHeading - robotHeading);
-
-        // Cosine speed scaling: reduce forward speed when heading error is large.
-        // At 0° error → full speed. At 90° error → minimum crawl. Smooth in between.
-        // This prevents wide diagonal arcs when heading is misaligned.
-        double clampedError = Math.min(Math.abs(error), Math.PI / 2.0);
-        float effectiveSpeed = (float)(speed * Math.cos(clampedError));
-        effectiveSpeed = Math.max(0.3f, effectiveSpeed);  // Never fully stop
-
-        // Proportional steering: negative sign because:
-        //   error > 0 (target to the left) → need to turn left → rightVel > leftVel → steer < 0
-        //   error < 0 (target to the right) → need to turn right → leftVel > rightVel → steer > 0
-        double steer = -STEERING_GAIN * error;
-
-        // Clamp steering to prevent wheel reversal during normal navigation
-        steer = Math.max(-effectiveSpeed, Math.min(effectiveSpeed, steer));
-
-        float leftVel  = (float)(effectiveSpeed + steer);
-        float rightVel = (float)(effectiveSpeed - steer);
-        setVel(leftVel, rightVel);
-        return false;
-    }
-
-
-    /********************************************************************************************************************
-     *                                           BEHAVIOUR 1: AVOID                                                     *
-     *  Priority    : 1 (Highest — subsumes all other behaviours)                                                       *
-     *  Sensors     : Ultrasonic sensors 0 (front-left), 1 (front-centre), 2 (front-right)                             *
-     *  Activation  : TLU fires when front obstacle proximity exceeds threshold                                         *
-     *  Action      : Proportional reactive steering away from the obstacle                                             *
-     *  Note        : Side sensors (3, 4, 5) are NOT used because their wide detection angle                            *
-     *                causes false positives that prevent forward movement.                                              *
-     ********************************************************************************************************************/
-
-    /**
-     * Method     : Controller::shouldAvoid()
-     * Purpose    : TLU activation check for the AVOID behaviour.
-     * Parameters : s0, s1, s2 - front sonar readings (0-1m, 1.0 = clear).
-     * Returns    : True if obstacle avoidance should activate.
-     **/
-    private boolean shouldAvoid(double s0, double s1, double s2) {
-        // Range-gated proximity: obstacles beyond AVOID_RANGE contribute 0.
-        // This prevents avoidance from firing when the robot is 0.5-0.7m from a wall
-        // (which happens constantly when driving parallel to walls).
-        double p0 = Math.max(0.0, (AVOID_RANGE - s0) / AVOID_RANGE);
-        double p1 = Math.max(0.0, (AVOID_RANGE - s1) / AVOID_RANGE);
-        double p2 = Math.max(0.0, (AVOID_RANGE - s2) / AVOID_RANGE);
-        double[] proximitySensors = {p0, p1, p2};
-        return tlu(AVOID_WEIGHTS, proximitySensors, AVOID_THRESHOLD);
-    }
-
-    /**
-     * Method     : Controller::executeAvoid()
-     * Purpose    : Executes the AVOID behaviour by steering away from obstacles.
-     * Parameters : s0, s1, s2 - front sonar readings.
-     * Notes      : ALWAYS TURNS RIGHT when obstacle detected (consistent right-turn bias).
-     *              This creates predictable wall-following behavior.
-     **/
-    private void executeAvoid(double s0, double s1, double s2) {
-        avoidActivations++;
-        currentBehavior = "AVOID";
-
-        // Freeze heading estimation so AVOID steering doesn't corrupt the
-        // navigation heading used by CLEAN/TRACK after the obstacle is cleared.
-        headingFrozen = true;
-        avoidSettleCounter = AVOID_SETTLE_TICKS;  // Keep frozen for N ticks after AVOID ends
-
-        // Range-gated proximity (consistent with shouldAvoid)
-        double leftProx   = Math.max(0.0, (AVOID_RANGE - s0) / AVOID_RANGE);
-        double centerProx = Math.max(0.0, (AVOID_RANGE - s1) / AVOID_RANGE);
-        double rightProx  = Math.max(0.0, (AVOID_RANGE - s2) / AVOID_RANGE);
-
-        double steer;
-        float speed;
-
-        if (s1 < 0.15) {
-            // EMERGENCY: Obstacle very close directly ahead (< 15cm).
-            // Always turn RIGHT (positive steer) at low speed.
-            speed = 0.5f;
-            steer = 3.5;    // Hard right turn
-        } else if (centerProx > 0.5) {
-            // MODERATE: Center obstacle within ~23cm. Moderate right turn with reduced speed.
-            speed = 1.5f;
-            steer = 2.5;    // Medium right turn
+     * Update heading every tick.
+     * Step 1: integrate encoder differential (works while spinning).
+     * Step 2: calibrate to GPS bearing whenever robot has moved ≥ GPS_CALIB_DIST.
+     */
+    private void updateHeading(double gpsX, double gpsY) {
+        // ── Encoder integration ───────────────────────────────────────────
+        double encL = getLeftWheelEnc();
+        double encR = getRightWheelEnc();
+        if (!encHInit) {
+            encHL_prev = encL; encHR_prev = encR; encHInit = true;
         } else {
-            // GENTLE: Proportional right-biased steering while maintaining forward speed.
-            // Use average proximity to determine turn intensity (higher proximity = sharper right turn).
-            speed = AVOID_DRIVE_SPEED;
-            double avgProx = (leftProx + centerProx + rightProx) / 3.0;
-            steer = avgProx * AVOID_STEER_GAIN;  // Positive = right turn
+            double dL = (encL - encHL_prev) * 2.0 * Math.PI * WHEEL_RADIUS;
+            double dR = (encR - encHR_prev) * 2.0 * Math.PI * WHEEL_RADIUS;
+            // dR - dL > 0 → right wheel went further → turned left → heading increases
+            headingEst = normAngle(headingEst + (dR - dL) / WHEEL_BASE);
         }
+        encHL_prev = encL; encHR_prev = encR;
 
-        setVel((float)(speed + steer), (float)(speed - steer));
+        // ── GPS calibration ───────────────────────────────────────────────
+        if (Double.isNaN(gpsCalibX)) { gpsCalibX = gpsX; gpsCalibY = gpsY; return; }
+        double moved = Math.hypot(gpsX - gpsCalibX, gpsY - gpsCalibY);
+        if (moved >= GPS_CALIB_DIST) {
+            // Snap heading to GPS movement bearing → removes encoder drift
+            headingEst = Math.atan2(gpsY - gpsCalibY, gpsX - gpsCalibX);
+            gpsCalibX = gpsX; gpsCalibY = gpsY;
+        }
     }
 
+    // =========================================================================
+    //  GPS WAYPOINT BOUSTROPHEDON PATH
+    //  Waypoints generated once. Navigated sequentially.
+    //  Lane structure:
+    //    Lane 0: y=CLEAN_MIN_Y, drive West→East
+    //    Lane 1: y+=SPACING,    drive East→West
+    //    Lane 2: y+=SPACING,    drive West→East  ...
+    //  Each lane = 2 waypoints: [lane-start, lane-end].
+    // =========================================================================
+    private List<double[]> waypoints      = new ArrayList<>();
+    private int            wpIndex        = 0;
+    private boolean        cleanStarted   = false;
+    private int            lanesCompleted = 0;   // lanes in current pass
+    private int            cleanPassCount = 0;   // how many full passes completed
+    private int            totalLanes     = 0;   // cumulative across all passes
+    private int            wpSkipped      = 0;   // total waypoints skipped due to obstacles
 
-    /********************************************************************************************************************
-     *                                           BEHAVIOUR 2: TRACK                                                     *
-     *  Priority    : 2 (Second highest — subsumes CLEAN and WANDER)                                                    *
-     *  Sensors     : Battery (percentage), GPS (distance to dock), Camera (marker detection + centering)              *
-     *  Activation  : TLU fires when battery <= 20% AND charger marker is visually detected                             *
-     *  Action      : Camera-based visual servoing toward the charger marker                                             *
-     *  Note        : GPS is used only to detect final docking range (< CHARGER_DOCK_RADIUS).                           *
-     ********************************************************************************************************************/
+    // ── Waypoint skip timeout ─────────────────────────────────────────────────
+    // If the robot has been trying to reach the same waypoint for longer than
+    // WP_TIMEOUT_MS, the waypoint is assumed blocked by an obstacle → skip it.
+    private static final long WP_TIMEOUT_MS = 6_000;   // 6 seconds per waypoint
+    private long   wpStartTime    = 0;    // wall-clock ms when current WP targeting began
+    private int    wpLastIndex    = -1;   // which WP the timer is currently tracking
+
+    // ── Stuck detector ────────────────────────────────────────────────────────
+    // If GPS has moved less than STUCK_DIST_M in STUCK_CHECK_MS, the robot is
+    // physically stuck (wedged against obstacle). Execute a backup escape maneuver.
+    private static final double STUCK_DIST_M    = 0.08;   // metres — less than this = stuck
+    private static final long   STUCK_CHECK_MS  = 3_000;  // check window in ms
+    private static final long   BACKUP_DURATION_MS = 1_200; // how long to reverse
+    private long   stuckCheckStart   = 0;
+    private double stuckCheckX       = Double.NaN;
+    private double stuckCheckY       = Double.NaN;
+    private boolean inBackup         = false;
+    private long    backupStart      = 0;
+    private int     backupDir        = 1;  // +1 or -1, alternates each escape
 
     /**
-     * Method     : Controller::shouldTrack()
-     * Purpose    : TLU activation check for the TRACK behaviour.
-     * Parameters : batteryPct - current battery percentage (continuous 0.0–100.0).
-     *              targetScore - camera template matching score for charger marker.
-     * Returns    : True only when battery is critical and visual target is detected.
-     **/
-    private boolean shouldTrack(double batteryPct, double targetScore) {
-        double lowBattery = (batteryPct <= TRACK_BATT_TRIGGER_PCT) ? 1.0 : 0.0;
-        double visualDetected = (targetScore >= TRACK_VISUAL_SCORE_THRESHOLD) ? 1.0 : 0.0;
-        double[] sensors = { lowBattery, visualDetected };
-        return tlu(TRACK_WEIGHTS, sensors, TRACK_THRESHOLD);
+     * Committed turn direction for navigateToWaypoint().
+     *  0  = not in spin mode (direction will be set on next spin entry)
+     * -1  = spinning left  (headingEst increasing, right wheel forward)
+     * +1  = spinning right (headingEst decreasing, left wheel forward)
+     *
+     * Set ONCE on entry to spin mode, held until |err| drops below threshold.
+     * Without this, normAngle() flips sign the instant headingEst crosses ±π
+     * during a 180° U-turn, reversing the spin every tick → robot oscillates.
+     */
+    private int committedTurnDir = 0;
+
+    private void generateWaypoints() {
+        waypoints.clear();
+        boolean ltr = true;
+        int lane = 0;
+        for (double y = CLEAN_MIN_Y; y <= CLEAN_MAX_Y + 0.001; y += LANE_SPACING) {
+            double cy = Math.min(y, CLEAN_MAX_Y);
+            if (ltr) { waypoints.add(new double[]{CLEAN_MIN_X,cy}); waypoints.add(new double[]{CLEAN_MAX_X,cy}); }
+            else      { waypoints.add(new double[]{CLEAN_MAX_X,cy}); waypoints.add(new double[]{CLEAN_MIN_X,cy}); }
+            ltr = !ltr; lane++;
+        }
+        System.out.printf("[CLEAN] %d waypoints, %d lanes%n", waypoints.size(), lane);
+        for (int i=0;i<waypoints.size();i++)
+            System.out.printf("  WP%02d: (%.2f, %.2f)%n",i,waypoints.get(i)[0],waypoints.get(i)[1]);
     }
 
     /**
-     * Method     : Controller::executeTrack()
-     * Purpose    : Executes the TRACK behaviour via camera-based marker tracking.
-     * Parameters : gpsX, gpsY - current GPS coordinates.
-     *              targetScore - camera template matching score for charger marker.
-     * Notes      : Uses getTargetX(), getTargetY(), getTargetMaxScore() for visual control.
-     *              GPS is used only for final docking distance check.
-     **/
-    private void executeTrack(double gpsX, double gpsY, double targetScore) {
-        trackActivations++;
-        currentBehavior = "TRACK";
+     * Steer toward (tx,ty) from current GPS (gpsX,gpsY).
+     *
+     * Bearing error  = atan2(ty-gpsY, tx-gpsX) - headingEst
+     * If |error| > 25°: spin toward bearing (encoder integration moves headingEst → never stuck).
+     * If |error| ≤ 25°: drive forward + proportional lateral correction.
+     *
+     * Convention check (critical for correct turn direction):
+     *   setVel(leftVel, rightVel)
+     *   Positive L, zero R  → turns right  → heading decreases
+     *   Zero L, positive R  → turns left   → heading increases
+     *   So: dθ = (dR - dL) / WHEEL_BASE  [CCW positive] ✓
+     *
+     *   For heading error > 0 (waypoint is to our left, CCW):
+     *     Need to turn left → increase heading → dR > dL
+     *     → setVel(−TURN, +TURN)  which is setVel(spin, −spin) with spin=−TURN ✓
+     */
+    private void navigateToWaypoint(double gpsX, double gpsY, double tx, double ty) {
+        double dist    = Math.hypot(tx-gpsX, ty-gpsY);
+        double bearing = Math.atan2(ty-gpsY, tx-gpsX);
+        double err     = normAngle(bearing - headingEst);
 
-        double dist = Utils.getEuclidean(gpsX, gpsY, CHARGER_XCOORD, CHARGER_YCOORD);
+        // Slow down near waypoint to avoid overshoot
+        float speed = (dist < 0.50) ? DRIVE_SPEED * 0.5f : DRIVE_SPEED;
 
-        // Check if docked
-        if (dist < CHARGER_DOCK_RADIUS) {
-            setVel(0, 0);
-            dockedAtCharger = true;
+        if (Math.abs(err) > HEADING_TURN_THRESHOLD) {
+            // ── SPIN MODE ────────────────────────────────────────────────
+            // Commit to a turn direction on the FIRST tick of a spin.
+            // Do NOT re-evaluate err sign while spinning — normAngle() wraps
+            // at ±π so a 180° U-turn causes err to flip sign every tick if
+            // we recalculate, making the robot oscillate left↔right forever.
+            if (committedTurnDir == 0) {
+                // err > 0 → waypoint is to our left → turn left → dir = -1
+                // err < 0 → waypoint is to our right → turn right → dir = +1
+                committedTurnDir = (err >= 0) ? -1 : +1;
+            }
+            // committedTurnDir = -1: left turn → right wheel fwd, left bwd
+            //   setVel(spin, -spin) with spin < 0 → setVel(-TURN, +TURN) ✓
+            // committedTurnDir = +1: right turn → left wheel fwd, right bwd
+            //   setVel(spin, -spin) with spin > 0 → setVel(+TURN, -TURN) ✓
+            float spin = committedTurnDir * TURN_SPEED;   // -1*T or +1*T
+            setVel(spin, -spin);
 
-            // Begin simulated charging once docked
-            if (!chargingComplete) {
-                if (chargeStartMs == 0) {
-                    chargeStartMs = System.currentTimeMillis();
-                    chargeStartBattPct = getBatteryPercentage();
-                    batteryTimer.suspend(); // Freeze battery drain while charging
-                    chargingOverridePct = chargeStartBattPct; // Start override at current level
+        } else {
+            // ── DRIVE MODE ───────────────────────────────────────────────
+            // Turn complete — reset so next turn gets a fresh direction check.
+            committedTurnDir = 0;
+            // Proportional steering correction.
+            // err > 0 → drifted right → steer left → slow left, speed right
+            double Kp = 2.5;
+            double steer = Math.max(-speed, Math.min(speed, Kp * err));
+            setVel((float)(speed - steer), (float)(speed + steer));
+        }
+    }
+
+    // CLEAN phase label
+    private enum CleanPhase { WAITING_GPS, NAVIGATING, COMPLETE }
+    private CleanPhase cleanPhase = CleanPhase.WAITING_GPS;
+
+    // ── Wander state ──────────────────────────────────────────────────────────
+    private static final int WANDER_INTERVAL = 400;
+    private static final int WANDER_DURATION = 200;
+    private int    wanderTick  = 0;
+    private double wanderSteer = 0.0;
+
+    // ── Track/dock state ──────────────────────────────────────────────────────
+    private boolean docked            = false;
+    private boolean chargingDone      = false;
+    private boolean simulationComplete = false;   // set true to stop both threads
+    private long    chargeStart       = 0;
+    private static final long CHARGE_DURATION_MS = 10_000;   // 10 s simulated charge
+
+    // ── Metrics ───────────────────────────────────────────────────────────────
+    private double distanceTravelled=0, prevEncLeft=0, prevEncRight=0;
+    private boolean metricsInit=false;
+    private List<String> dataLog=new ArrayList<>(), eventLog=new ArrayList<>();
+    private boolean  dataExported=false;
+    private int      loopCount=0;
+    private static final int LOG_INTERVAL = 50;   // log every 50 ticks → ~denser GPS trail for scatter plot
+    private int    avoidCount=0,trackCount=0,cleanCount=0,wanderCount=0;
+    private String activeBehaviour="INIT", prevBehaviour="INIT";
+    private int    behavTransitions=0;
+    private boolean loggedBatt40=false, loggedBatt20=false;
+    private boolean autonomousMode=false, initialized=false;
+
+    // =========================================================================
+    //  TLU
+    // =========================================================================
+    private boolean tlu(double[] w, double[] s, double f) {
+        double sum=0; for(int i=0;i<w.length&&i<s.length;i++) sum+=w[i]*s[i]; return sum>f;
+    }
+
+    private void logEvent(String type, String detail) {
+        double t=getBatteryTime();
+        eventLog.add(String.format("%.2f,%d,%s,%s",t,loopCount,type,detail));
+        System.out.printf("[EVENT|t=%.1fs] %-22s %s%n",t,type,detail);
+    }
+
+    private void updateDistance() {
+        double eL=getLeftWheelEnc(),eR=getRightWheelEnc();
+        if(!metricsInit){prevEncLeft=eL;prevEncRight=eR;metricsInit=true;return;}
+        double cL=eL*2*Math.PI*WHEEL_RADIUS, cR=eR*2*Math.PI*WHEEL_RADIUS;
+        double pL=prevEncLeft*2*Math.PI*WHEEL_RADIUS, pR=prevEncRight*2*Math.PI*WHEEL_RADIUS;
+        distanceTravelled+=Utils.getEuclidean(pL,pR,cL,cR);
+        prevEncLeft=eL; prevEncRight=eR;
+    }
+
+    // =========================================================================
+    //  BEHAVIOUR 1 — AVOID
+    //  TLU inputs: normalised proximity from US0, US1, US2 (front sensors)
+    //  proximity = max(0, (AVOID_RANGE - range) / AVOID_RANGE)
+    // =========================================================================
+    private boolean shouldAvoid(double s0,double s1,double s2) {
+        double p0=Math.max(0,(AVOID_RANGE-s0)/AVOID_RANGE);
+        double p1=Math.max(0,(AVOID_RANGE-s1)/AVOID_RANGE);
+        double p2=Math.max(0,(AVOID_RANGE-s2)/AVOID_RANGE);
+        return tlu(AVOID_W,new double[]{p0,p1,p2},AVOID_F);
+    }
+    private void executeAvoid(double s0,double s1,double s2) {
+        avoidCount++; activeBehaviour="AVOID";
+        double p0=Math.max(0,(AVOID_RANGE-s0)/AVOID_RANGE);
+        double p1=Math.max(0,(AVOID_RANGE-s1)/AVOID_RANGE);
+        double p2=Math.max(0,(AVOID_RANGE-s2)/AVOID_RANGE);
+        if(s1<0.15||s0<0.12||s2<0.12){double st=(p0>p2)?-1.5:1.5;setVel((float)(-1.0+st),(float)(-1.0-st));return;}
+        float speed; double steer;
+        if(p1>0.6){speed=1.5f;steer=(p0>p2)?-2.5:2.5;}
+        else{speed=2.5f;steer=(p0-p2)*2.5+p1*1.5;steer=Math.max(-3,Math.min(3,steer));}
+        setVel((float)(speed+steer),(float)(speed-steer));
+    }
+
+    // =========================================================================
+    //  BEHAVIOUR 2 — TRACK
+    //  TLU input: battery ≤ 20%  (camera NOT required — fixes the main nav problem)
+    //
+    //  Navigation strategy:
+    //    Phase A (dist > 0.60m): GPS-direct bearing navigation using the same
+    //      hybrid heading estimator as CLEAN. Robot drives straight to charger
+    //      GPS coordinates. No camera needed → always fires when batt ≤ 20%.
+    //    Phase B (dist ≤ 0.60m): Camera visual servoing for precise final dock.
+    //      If camera still can't see marker, continue GPS approach at slow speed.
+    //    Phase C (dist < 0.30m): Docked. Stop, charge, end simulation.
+    //
+    //  Why the old approach failed:
+    //    Old TLU: lowBatt AND camScore — if camera can't see marker, TRACK never
+    //    fires, robot wanders for minutes burning the last 10% of battery.
+    //    New TLU: lowBatt alone — always navigates toward charger GPS when low.
+    // =========================================================================
+    private boolean shouldTrack(double batt, double cam) {
+        // Fire on battery alone — camera not required to start homing
+        double lowBatt = (batt <= TRACK_BATT_PCT) ? 1.0 : 0.0;
+        return tlu(new double[]{1.0}, new double[]{lowBatt}, 0.5);
+    }
+
+    private void executeTrack(double gpsX, double gpsY, double cam) {
+        trackCount++; activeBehaviour = "TRACK";
+        double dist = Math.hypot(gpsX - CHARGER_XCOORD, gpsY - CHARGER_YCOORD);
+
+        // ── Phase C: Docked ───────────────────────────────────────────────
+        if (dist < 0.30) {
+            setVel(0, 0); docked = true;
+            if (!chargingDone) {
+                if (chargeStart == 0) {
+                    chargeStart = System.currentTimeMillis();
                     System.out.println("============================================");
-                    System.out.println("  DOCKED AT CHARGING STATION");
-                    System.out.println("  Final position: (" + gpsX + ", " + gpsY + ")");
-                    System.out.println("  Distance to charger: " + Utils.getDecimal(dist, "0.00") + "m");
-                    System.out.println("  Battery (before charge): " + String.format("%.1f", chargeStartBattPct) + "%");
-                    System.out.println("  Charging for " + (CHARGE_DURATION_MS/1000) + "s...");
+                    System.out.printf("  DOCKED at GPS(%.2f,%.2f)%n", gpsX, gpsY);
+                    System.out.printf("  Charging — battery will rise to 100%%%n");
                     System.out.println("============================================");
+                    logEvent("DOCKED", String.format("pos=(%.2f,%.2f) batt=%.1f%%", gpsX, gpsY, getBatteryPercentage()));
+                }
+                // Grow chargeOffset so getBatteryCapacity() increases each tick
+                double elapsedChargeSec = (System.currentTimeMillis() - chargeStart) / 1000.0;
+                chargeOffset = elapsedChargeSec * CHARGE_RATE_PER_SEC;
+
+                // Print charging progress every ~2s
+                if ((int)(elapsedChargeSec) % 2 == 0 && (int)(elapsedChargeSec) > 0) {
+                    System.out.printf("  Charging: %.0f%%%n", getBatteryPercentage());
                 }
 
-                long elapsedCharge = System.currentTimeMillis() - chargeStartMs;
-                double chargeProgress = Math.min(1.0, (double) elapsedCharge / CHARGE_DURATION_MS);
-
-                // Gradually increase battery from dock-time % to 100% over charge duration
-                chargingOverridePct = chargeStartBattPct + (100.0 - chargeStartBattPct) * chargeProgress;
-
-                if (elapsedCharge >= CHARGE_DURATION_MS) {
-                    // Fully charged: reset battery timer and clear override
-                    batteryTimer.restart(); // counter=0 = full battery
-                    chargingOverridePct = -1.0; // Let normal getBatteryPercentage() take over
-                    chargeStartMs = 0;
-                    chargingComplete = true;
-                    System.out.println("[CHARGE] Battery restored to 100%. Ending experiment.");
-                    if (!experimentExported) {
-                        exportExperimentData("DOCKED_AND_CHARGED");
-                    }
+                if (getBatteryPercentage() >= 99.0) {
+                    chargingDone = true;
+                    System.out.println("============================================");
+                    System.out.println("  CHARGING COMPLETE — simulation ending");
+                    System.out.printf("  Battery: %.1f%%  Distance: %.2fm%n", getBatteryPercentage(), distanceTravelled);
+                    System.out.printf("  Clean passes: %d  Total lanes: %d%n", cleanPassCount, totalLanes);
+                    System.out.println("============================================");
+                    logEvent("CHARGE_COMPLETE", String.format("pos=(%.2f,%.2f) dist=%.2fm passes=%d batt=%.1f%%",
+                            gpsX, gpsY, distanceTravelled, cleanPassCount, getBatteryPercentage()));
+                    exportData("CHARGE_COMPLETE");
+                    simulationComplete = true;
                 }
             }
             return;
         }
 
-        // Visual target lost while in TRACK: spin slowly to reacquire marker.
-        if (targetScore < TRACK_VISUAL_SCORE_THRESHOLD) {
-            setVel(TRACK_SEARCH_SPIN_SPEED, -TRACK_SEARCH_SPIN_SPEED);
+        // ── Phase B: Close — camera fine approach ─────────────────────────
+        if (dist <= 0.60 && cam >= TRACK_CAM_SCORE) {
+            double normX = Math.max(-1, Math.min(1, (getTargetX() - getImageWidth() / 2.0) / (getImageWidth() / 2.0)));
+            float speed = (dist < 0.40) ? DRIVE_SPEED * 0.3f : DRIVE_SPEED * 0.5f;
+            double steer = Math.max(-speed, Math.min(speed, 1.8 * normX));
+            setVel((float)(speed + steer), (float)(speed - steer));
             return;
         }
 
-        // Camera-based approach: center target horizontally in image.
-        int imgW = getImageWidth();
-        int imgH = getImageHeight();
-        double imgCenterX = imgW / 2.0;
-        int targetX = getTargetX();
-        int targetY = getTargetY();
-        double normalizedXError = (targetX - imgCenterX) / imgCenterX;
-        normalizedXError = Math.max(-1.0, Math.min(1.0, normalizedXError));
+        // ── Phase A: GPS-direct bearing navigation ────────────────────────
+        // Same approach as CLEAN waypoint navigation — compute bearing to
+        // charger GPS coords, use hybrid heading estimator, proportional steer.
+        updateHeading(gpsX, gpsY);
+        double bearing = Math.atan2(CHARGER_YCOORD - gpsY, CHARGER_XCOORD - gpsX);
+        double err = normAngle(bearing - headingEst);
+        float speed = (dist < 0.80) ? DRIVE_SPEED * 0.5f : DRIVE_SPEED;
 
-        // Keep using GPS distance to slow down near dock.
-        float speed;
-        if (dist < 0.6) {
-            speed = DRIVE_SPEED * 0.4f;  // Very slow final approach
-        } else if (dist < 1.2) {
-            speed = DRIVE_SPEED * 0.7f;  // Medium approach
+        if (Math.abs(err) > HEADING_TURN_THRESHOLD) {
+            if (committedTurnDir == 0) committedTurnDir = (err >= 0) ? -1 : +1;
+            setVel(committedTurnDir * TURN_SPEED, -committedTurnDir * TURN_SPEED);
         } else {
-            speed = DRIVE_SPEED;          // Full speed when far
+            committedTurnDir = 0;
+            double steer = Math.max(-speed, Math.min(speed, 2.5 * err));
+            setVel((float)(speed - steer), (float)(speed + steer));
         }
-
-        // Use vertical position as an extra speed damping factor.
-        double normalizedY = Math.max(0.0, Math.min(1.0, targetY / (double) imgH));
-        speed = (float) (speed * Math.max(0.6, normalizedY));
-
-        double steer = TRACK_CAMERA_STEER_GAIN * normalizedXError;
-        steer = Math.max(-speed, Math.min(speed, steer));
-
-        setVel((float) (speed + steer), (float) (speed - steer));
     }
 
-
-    /********************************************************************************************************************
-     *                                           BEHAVIOUR 3: CLEAN                                                     *
-     *  Priority    : 3 (Subsumes only WANDER)                                                                          *
-     *  Sensors     : Battery (percentage), GPS (position) for waypoint navigation                                      *
-    *  Activation  : TLU fires when battery percentage is in 40–100%                                                   *
-     *  Action      : Follow a pre-computed lawn-mower waypoint path across the room                                    *
-     *  Note        : Pattern restarts from the beginning if all waypoints are visited.                                  *
-     ********************************************************************************************************************/
-
-    /**
-     * Method     : Controller::shouldClean()
-     * Purpose    : TLU activation check for the CLEAN behaviour.
-     * Parameters : batteryPct - current battery percentage.
-     * Returns    : True if battery is within assignment CLEAN band (40–100%).
-     **/
-    private boolean shouldClean(double batteryPct) {
-        double[] sensors = { (batteryPct >= CLEAN_BATT_MIN_PCT) ? 1.0 : 0.0 };
-        return tlu(CLEAN_WEIGHTS, sensors, CLEAN_THRESHOLD);
+    // =========================================================================
+    //  BEHAVIOUR 3 — CLEAN
+    //  TLU input: battery ≥ 40% (1.0) else 0.0
+    //
+    //  GPS Waypoint Navigation with Hybrid Heading:
+    //   • GPS validity guard: holds still if GPS is bogus (cold-start overflow).
+    //   • Generates waypoints once when GPS becomes valid.
+    //   • Calls updateHeading() every tick (encoder-primary, GPS-calibrated).
+    //   • Reaches waypoint → advance index. Spin+drive toward next.
+    // =========================================================================
+    private boolean shouldClean(double batt) {
+        return tlu(CLEAN_W,new double[]{batt>=CLEAN_BATT_PCT?1.0:0.0},CLEAN_F);
     }
 
-    /**
-     * Method     : Controller::executeClean()
-     * Purpose    : Executes the CLEAN behaviour using QUADRANT-BASED navigation.
-     *              Room is divided into 4 quadrants. The robot completes all waypoints
-     *              in one quadrant before moving to the next.
-     *
-     *              KEY DESIGN:
-     *              - On each quadrant entry, finds the NEAREST waypoint to the robot's
-     *                current position (not WP 0 which may be in a far corner).
-     *              - Navigates sequentially from that nearest WP, wrapping around within
-     *                the quadrant's WP array until all are handled.
-     *              - Tracks handled WPs (reached + skipped) separately from the index.
-     *              - If robot drifts outside quadrant bounds (due to AVOID), steers it
-     *                back toward the target WP which is inside the quadrant.
-     *
-     * Parameters : gpsX, gpsY - current GPS coordinates.
-     **/
     private void executeClean(double gpsX, double gpsY) {
-        cleanActivations++;
-        currentBehavior = "CLEAN";
+        cleanCount++; activeBehaviour="CLEAN";
 
-        // ── INITIALISE on first call: start from nearest WP to current position ──
-        if (!cleanPatternStarted) {
-            cleanPatternStarted = true;
-            cleanState = CleanState.NAVIGATE_TO_WP;
-            turnTickCount = 0;
-            wpStuckCounter = 0;
-            currentWaypointIdx = findNearestWaypoint(gpsX, gpsY);
-            System.out.printf("[CLEAN] Starting at WP %d/%d (%.2f, %.2f)%n",
-                    currentWaypointIdx + 1, cleaningWaypoints.length,
-                    cleaningWaypoints[currentWaypointIdx][0],
-                    cleaningWaypoints[currentWaypointIdx][1]);
+        // ── GPS validity guard ────────────────────────────────────────────
+        // Do NOT start until GPS reports a sane room coordinate.
+        // This prevents the Long.MAX_VALUE cold-start overflow from
+        // corrupting the waypoint list or heading calibration.
+        if (!isGpsValid(gpsX, gpsY)) {
+            cleanPhase = CleanPhase.WAITING_GPS;
+            setVel(0, 0);
+            return;
         }
 
-        double[] wp = cleaningWaypoints[currentWaypointIdx];
-        double dx          = wp[0] - gpsX;
-        double dy          = wp[1] - gpsY;
-        double distance    = Math.sqrt(dx * dx + dy * dy);
-        double desiredHdg  = Math.atan2(dy, dx);
+        // ── First-time initialisation ─────────────────────────────────────
+        if (!cleanStarted) {
+            cleanStarted   = true;
+            cleanPhase     = CleanPhase.NAVIGATING;
+            wpIndex        = 0;
+            lanesCompleted = 0;
+            generateWaypoints();
+            // Seed GPS calibration reference at confirmed valid position
+            gpsCalibX = gpsX;
+            gpsCalibY = gpsY;
+            logEvent("CLEAN_START",
+                    String.format("pos=(%.2f,%.2f) totalWP=%d", gpsX, gpsY, waypoints.size()));
+        }
 
-        // ── TURNING STATE: spin in place until aligned ────────────────────
-        if (cleanState == CleanState.TURNING_TO_WP) {
-            turnTickCount++;
-            if (!headingKnown) {
-                // Drive slowly forward until heading becomes known
-                setVel(DRIVE_SPEED * 0.4f, DRIVE_SPEED * 0.4f);
+        // ── All waypoints complete — restart the cleaning pass ────────────
+        //
+        // Assignment requires the robot to operate continuously:
+        //   battery 40-100%  →  CLEAN (this behaviour)
+        //   battery 20-40%   →  WANDER (CLEAN and TRACK both inactive → fallback)
+        //   battery ≤ 20%    →  TRACK  (return to charging station)
+        //
+        // So when all waypoints are done we do NOT stop.  Instead we reset the
+        // clean state so the subsumption re-enters CLEAN on the next tick and
+        // starts another pass from the beginning.  If the battery has dropped
+        // below CLEAN_BATT_PCT by then, CLEAN won't fire and WANDER/TRACK
+        // will run instead — exactly the intended behaviour.
+        if (wpIndex >= waypoints.size()) {
+            cleanPassCount++;
+            totalLanes += lanesCompleted;
+            logEvent("CLEAN_PASS_DONE",
+                    String.format("pass=%d lanes=%d totalLanes=%d dist=%.2fm pos=(%.2f,%.2f)",
+                            cleanPassCount, lanesCompleted, totalLanes,
+                            distanceTravelled, gpsX, gpsY));
+            System.out.printf("[CLEAN] Pass %d complete — %d lanes, %.2fm total distance%n",
+                    cleanPassCount, lanesCompleted, distanceTravelled);
+            // Reset clean state → next CLEAN tick re-initialises from current GPS
+            cleanStarted   = false;
+            cleanPhase     = CleanPhase.WAITING_GPS;
+            wpIndex        = 0;
+            lanesCompleted = 0;
+            // Reset heading estimator so new pass gets a fresh calibration
+            encHInit         = false;
+            gpsCalibX        = Double.NaN;
+            gpsCalibY        = Double.NaN;
+            committedTurnDir = 0;
+            // Reset obstacle-handling state
+            wpStartTime      = 0;
+            wpLastIndex      = -1;
+            stuckCheckStart  = 0;
+            stuckCheckX      = Double.NaN;
+            stuckCheckY      = Double.NaN;
+            inBackup         = false;
+            return;
+        }
+
+        // ── Update heading (encoder+GPS) ──────────────────────────────────
+        updateHeading(gpsX, gpsY);
+
+        // ── Check waypoint reached ────────────────────────────────────────
+        double[] wp   = waypoints.get(wpIndex);
+        double   dist = Math.hypot(wp[0]-gpsX, wp[1]-gpsY);
+
+        if (dist < WP_REACH_RADIUS) {
+            if (wpIndex % 2 == 1) {
+                lanesCompleted++;
+                logEvent("LANE_DONE", String.format("lane=%d pos=(%.2f,%.2f)", lanesCompleted, gpsX, gpsY));
+            }
+            logEvent("WP_REACHED", String.format("wp=%d pos=(%.2f,%.2f) err=%.3fm", wpIndex, gpsX, gpsY, dist));
+            wpIndex++;
+            committedTurnDir = 0;
+            wpStartTime      = 0;    // reset timeout for next WP
+            wpLastIndex      = -1;
+            stuckCheckStart  = 0;    // reset stuck detector
+            stuckCheckX      = Double.NaN;
+            stuckCheckY      = Double.NaN;
+            inBackup         = false;
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+
+        // ── MECHANISM 1: Backup escape maneuver ───────────────────────────
+        // If currently executing a backup, keep reversing until timer expires,
+        // then release and let normal navigation resume. AVOID stays active above
+        // us in the subsumption stack, so this is only reached when clear.
+        if (inBackup) {
+            long elapsed = now - backupStart;
+            if (elapsed < BACKUP_DURATION_MS) {
+                // Reverse + slight turn to escape the pocket
+                float rev = -DRIVE_SPEED * 0.6f;
+                float turn = backupDir * TURN_SPEED * 0.4f;
+                setVel(rev - turn, rev + turn);
+                return;
+            } else {
+                // Backup complete — release, reset stuck detector, continue
+                inBackup        = false;
+                backupDir       = -backupDir;   // alternate direction each escape
+                stuckCheckStart = 0;
+                stuckCheckX     = Double.NaN;
+                stuckCheckY     = Double.NaN;
+                committedTurnDir= 0;
+                logEvent("BACKUP_DONE", String.format("wp=%d pos=(%.2f,%.2f)", wpIndex, gpsX, gpsY));
+            }
+        }
+
+        // ── MECHANISM 2: Stuck detector ───────────────────────────────────
+        // Seed the reference position on first call for this check window.
+        if (stuckCheckStart == 0 || Double.isNaN(stuckCheckX)) {
+            stuckCheckStart = now;
+            stuckCheckX     = gpsX;
+            stuckCheckY     = gpsY;
+        } else if (now - stuckCheckStart >= STUCK_CHECK_MS) {
+            double moved = Math.hypot(gpsX - stuckCheckX, gpsY - stuckCheckY);
+            if (moved < STUCK_DIST_M) {
+                // Robot has barely moved in STUCK_CHECK_MS → physically trapped
+                inBackup    = true;
+                backupStart = now;
+                logEvent("STUCK_ESCAPE", String.format(
+                    "wp=%d moved=%.3fm pos=(%.2f,%.2f) dir=%d",
+                    wpIndex, moved, gpsX, gpsY, backupDir));
+                System.out.printf("[STUCK] WP%d blocked — backing up (dir=%d)%n", wpIndex, backupDir);
                 return;
             }
-            double headingError = normalizeAngle(desiredHdg - robotHeading);
-            if (Math.abs(headingError) < TURN_ALIGNED_THRESHOLD || turnTickCount > MAX_TURN_TICKS) {
-                // Aligned (or timed out) — switch back to navigate
-                cleanState = CleanState.NAVIGATE_TO_WP;
-                headingFrozen = false;
-                turnTickCount = 0;
-            } else {
-                // Spin toward target: positive error = target left = spin left
-                if (headingError > 0) {
-                    setVel(-SPIN_SPEED, SPIN_SPEED);
-                } else {
-                    setVel(SPIN_SPEED, -SPIN_SPEED);
-                }
-                return;  // Do NOT increment wpStuckCounter during turns
-            }
+            // Moved enough — reset window for next check
+            stuckCheckStart = now;
+            stuckCheckX     = gpsX;
+            stuckCheckY     = gpsY;
         }
 
-        // ── WAYPOINT REACHED ─────────────────────────────────────────────
-        if (distance < WAYPOINT_TOLERANCE) {
-            wpStuckCounter = 0;
-            totalWaypointsReached++;
-            System.out.printf("[CLEAN] WP %d/%d reached (%.2f,%.2f)  total=%d%n",
-                    currentWaypointIdx + 1, cleaningWaypoints.length,
-                    wp[0], wp[1], totalWaypointsReached);
-
-            // Advance to next WP (wrap around and restart)
-            currentWaypointIdx++;
-            if (currentWaypointIdx >= cleaningWaypoints.length) {
-                currentWaypointIdx = 0;
-                System.out.println("[CLEAN] All waypoints complete — restarting pattern.");
-            }
-
-            // If next WP requires a turn > TURN_TRIGGER_THRESHOLD, spin first
-            double[] nextWp   = cleaningWaypoints[currentWaypointIdx];
-            double nextDx     = nextWp[0] - gpsX;
-            double nextDy     = nextWp[1] - gpsY;
-            double nextHdg    = Math.atan2(nextDy, nextDx);
-            double nextError  = headingKnown ? Math.abs(normalizeAngle(nextHdg - robotHeading)) : 0.0;
-            if (nextError > TURN_TRIGGER_THRESHOLD) {
-                cleanState = CleanState.TURNING_TO_WP;
-                turnTickCount = 0;
-            }
+        // ── MECHANISM 3: Waypoint skip timeout ───────────────────────────
+        // If the robot has been targeting this waypoint longer than WP_TIMEOUT_MS
+        // without reaching it, the waypoint is permanently blocked → skip it.
+        if (wpLastIndex != wpIndex) {
+            // New waypoint — start fresh timer
+            wpLastIndex = wpIndex;
+            wpStartTime = now;
+        } else if (now - wpStartTime > WP_TIMEOUT_MS) {
+            wpSkipped++;
+            logEvent("WP_SKIPPED", String.format(
+                "wp=%d pos=(%.2f,%.2f) dist=%.2fm timeout=%ds totalSkipped=%d",
+                wpIndex, gpsX, gpsY, dist, WP_TIMEOUT_MS/1000, wpSkipped));
+            System.out.printf("[CLEAN] WP%d skipped (obstacle) — %.1fs elapsed, dist=%.2fm%n",
+                wpIndex, (now - wpStartTime)/1000.0, dist);
+            wpIndex++;
+            committedTurnDir = 0;
+            wpStartTime      = 0;
+            wpLastIndex      = -1;
+            stuckCheckStart  = 0;
+            stuckCheckX      = Double.NaN;
+            stuckCheckY      = Double.NaN;
+            inBackup         = false;
             return;
         }
 
-        // ── STUCK DETECTION (navigate ticks only, not turn ticks) ────────
-        wpStuckCounter++;
-        if (wpStuckCounter > MAX_WP_STUCK_TICKS) {
-            System.out.printf("[CLEAN] Stuck on WP %d for %d navigate-ticks — skipping%n",
-                    currentWaypointIdx + 1, wpStuckCounter);
-            wpStuckCounter = 0;
-            currentWaypointIdx = (currentWaypointIdx + 1) % cleaningWaypoints.length;
-            cleanState = CleanState.NAVIGATE_TO_WP;
-            return;
-        }
-
-        // ── DRIVE TOWARD WAYPOINT ────────────────────────────────────────
-        if (!headingKnown) {
-            setVel(DRIVE_SPEED * 0.4f, DRIVE_SPEED * 0.4f);
-            return;
-        }
-
-        double headingError = normalizeAngle(desiredHdg - robotHeading);
-
-        // No mid-navigate spin re-trigger — P-controller arcs for errors up to 90°.
-        // Removing this check eliminates the spin-loop trap where small encoder drift
-        // repeatedly triggered spinning before the robot could make forward progress.
-
-        // Proportional steering with cosine speed scaling
-        double clampedError   = Math.min(Math.abs(headingError), Math.PI / 2.0);
-        float  effectiveSpeed = (float)(DRIVE_SPEED * Math.cos(clampedError));
-        effectiveSpeed        = Math.max(0.4f, effectiveSpeed);
-        double steer          = -STEERING_GAIN * headingError;
-        steer                 = Math.max(-effectiveSpeed, Math.min(effectiveSpeed, steer));
-        setVel((float)(effectiveSpeed + steer), (float)(effectiveSpeed - steer));
+        // ── Steer toward waypoint ─────────────────────────────────────────
+        navigateToWaypoint(gpsX, gpsY, wp[0], wp[1]);
     }
 
-    /**
-     * Returns the index of the waypoint in cleaningWaypoints nearest to (gpsX, gpsY).
-     * Called once at the start of each CLEAN session to avoid long initial sprints.
-     */
-    private int findNearestWaypoint(double gpsX, double gpsY) {
-        int    nearestIdx  = 0;
-        double nearestDist = Double.MAX_VALUE;
-        for (int i = 0; i < cleaningWaypoints.length; i++) {
-            double d = Math.hypot(gpsX - cleaningWaypoints[i][0], gpsY - cleaningWaypoints[i][1]);
-            if (d < nearestDist) { nearestDist = d; nearestIdx = i; }
-        }
-        return nearestIdx;
+    // =========================================================================
+    //  BEHAVIOUR 4 — WANDER
+    //  TLU input: battery > 0% → always fires as fallback
+    // =========================================================================
+    private boolean shouldWander(double batt) {
+        return tlu(WANDER_W,new double[]{batt>0?1.0:0.0},WANDER_F);
     }
-
-
-    /********************************************************************************************************************
-     *                                           BEHAVIOUR 4: WANDER                                                    *
-     *  Priority    : 4 (Lowest — fallback behaviour)                                                                   *
-     *  Sensors     : Battery (implicit — only active when other behaviours don't fire)                                  *
-     *  Activation  : Always active (fallback)                                                                           *
-    *  Action      : Straight drive with random manoeuvres at scheduled intervals                                       *
-     ********************************************************************************************************************/
-
-    /**
-     * Method     : Controller::executeWander()
-     * Purpose    : Executes WANDER with timer-scheduled random manoeuvres.
-     * Notes      : Uses Timer.getSec() to start short random turns at fixed intervals.
-     **/
     private void executeWander() {
-        wanderActivations++;
-        currentBehavior = "WANDER";
-
-        // ── CLEAN → WANDER TRANSITION: abandon all waypoint state ────────────
-        // When battery drops below CLEAN_BATT_MIN_PCT (40%), CLEAN stops being called.
-        // cleanPatternStarted may still be true from a prior CLEAN run, which would
-        // cause CLEAN to resume from a stale mid-pattern position after recharging.
-        // Reset everything here so the next CLEAN entry starts fresh from the
-        // robot's post-wander position (nearest WP search will run again).
-        if (cleanPatternStarted) {
-            cleanPatternStarted = false;
-            cleanState = CleanState.NAVIGATE_TO_WP;
-            wpStuckCounter = 0;
-            turnTickCount = 0;
-            headingFrozen = false;
-            System.out.println("============================================");
-            System.out.printf("[WANDER] Battery below %.0f%% — leaving CLEAN, all waypoints abandoned.%n",
-                    CLEAN_BATT_MIN_PCT);
-            System.out.println("[WANDER] Moving randomly until battery critical (≤20%).");
-            System.out.println("============================================");
+        wanderCount++; activeBehaviour="WANDER";
+        if(cleanStarted){
+            cleanStarted=false; cleanPhase=CleanPhase.WAITING_GPS;
+            wpIndex=0; encHInit=false; gpsCalibX=Double.NaN; gpsCalibY=Double.NaN;
+            committedTurnDir=0;
+            wpStartTime=0; wpLastIndex=-1;
+            stuckCheckStart=0; stuckCheckX=Double.NaN; stuckCheckY=Double.NaN;
+            inBackup=false;
         }
-
-        int nowSec = wanderTimer.getSec();
-
-        if (nextWanderTurnSec < 0) {
-            nextWanderTurnSec = nowSec + WANDER_INTERVAL_SEC;
-        }
-
-        if (wanderTurnEndSec < 0 && nowSec >= nextWanderTurnSec) {
-            wanderSteerCmd = (Math.random() * 2.0 - 1.0) * WANDER_MAX_STEER;
-            wanderTurnEndSec = nowSec + WANDER_TURN_DURATION_SEC;
-        }
-
-        if (wanderTurnEndSec >= 0 && nowSec >= wanderTurnEndSec) {
-            wanderSteerCmd = 0.0;
-            wanderTurnEndSec = -1;
-            nextWanderTurnSec = nowSec + WANDER_INTERVAL_SEC;
-        }
-
-        setVel((float) (DRIVE_SPEED + wanderSteerCmd), (float) (DRIVE_SPEED - wanderSteerCmd));
+        wanderTick++;
+        if(wanderTick%(WANDER_INTERVAL+WANDER_DURATION)==WANDER_INTERVAL){wanderSteer=(Math.random()*2-1)*1.2;logEvent("WANDER_TURN",String.format("steer=%.2f",wanderSteer));}
+        if(wanderTick%(WANDER_INTERVAL+WANDER_DURATION)==0) wanderSteer=0.0;
+        setVel((float)(DRIVE_SPEED+wanderSteer),(float)(DRIVE_SPEED-wanderSteer));
     }
 
+    // =========================================================================
+    //  DATA EXPORT
+    //  Files are written to the Java working directory (project root).
+    //  Three output files per run, timestamped to avoid overwriting:
+    //    trajectory_<ts>.csv  — full sensor log every 50 ticks (for all graphs)
+    //    gps_scatter_<ts>.csv — GPS x,y only, 1 row/tick  (for GPS scatter plot)
+    //    events_<ts>.csv      — behaviour/waypoint events  (for timeline analysis)
+    //    report_<ts>.txt      — summary statistics
+    // =========================================================================
+    private void exportData(String reason) {
+        // Do NOT guard with dataExported — always write final state including
+        // the full charging sequence data.
+        dataExported = true;
+        double elapsed = getBatteryTime();
+        long   ts      = System.currentTimeMillis();
+        String prefix  = "run_" + ts;
 
-    /********************************************************************************************************************
-     *                                           update() and main()                                                    *
-     ********************************************************************************************************************/
+        // ── Full trajectory CSV ───────────────────────────────────────────
+        String tf = prefix + "_trajectory.csv";
+        try (PrintWriter pw = new PrintWriter(new FileWriter(tf))) {
+            pw.println("time_sec,gps_x,gps_y,battery_pct,left_enc,right_enc," +
+                       "distance_m,behaviour,sonar_0,sonar_1,sonar_2,cam_score," +
+                       "clean_phase,wp_index");
+            for (String r : dataLog) pw.println(r);
+            System.out.println("[EXPORT] Trajectory: " + tf + " (" + dataLog.size() + " rows)");
+        } catch (Exception e) { System.err.println("[EXPORT] trajectory: " + e.getMessage()); }
 
-    /**
-     * Method     : Controller::toggleAutonomousMode()
-     * Purpose    : FXML handler for the "Auto Mode" button. Starts or stops autonomous control.
-     * Notes      : When enabled, disables GUI teleoperation and init the subsumption controller.
-     *              When disabled, re-enables manual GUI control.
-     **/
+        // ── GPS scatter plot CSV (x,y + behaviour label for colour coding) ─
+        String gf = prefix + "_gps_scatter.csv";
+        try (PrintWriter pw = new PrintWriter(new FileWriter(gf))) {
+            pw.println("gps_x,gps_y,behaviour,battery_pct,time_sec");
+            for (String r : dataLog) {
+                String[] c = r.split(",");
+                if (c.length >= 8)
+                    pw.printf("%s,%s,%s,%s,%s%n", c[1], c[2], c[7], c[3], c[0]);
+            }
+            System.out.println("[EXPORT] GPS scatter: " + gf);
+        } catch (Exception e) { System.err.println("[EXPORT] gps_scatter: " + e.getMessage()); }
+
+        // ── Distance-time CSV (for distance vs time correlation plot) ──────
+        String df = prefix + "_distance_time.csv";
+        try (PrintWriter pw = new PrintWriter(new FileWriter(df))) {
+            pw.println("time_sec,distance_m,battery_pct,behaviour");
+            for (String r : dataLog) {
+                String[] c = r.split(",");
+                if (c.length >= 8)
+                    pw.printf("%s,%s,%s,%s%n", c[0], c[6], c[3], c[7]);
+            }
+            System.out.println("[EXPORT] Distance-time: " + df);
+        } catch (Exception e) { System.err.println("[EXPORT] distance_time: " + e.getMessage()); }
+
+        // ── Events CSV ───────────────────────────────────────────────────
+        String ef = prefix + "_events.csv";
+        try (PrintWriter pw = new PrintWriter(new FileWriter(ef))) {
+            pw.println("time_sec,tick,event_type,detail");
+            for (String r : eventLog) pw.println(r);
+            System.out.println("[EXPORT] Events: " + ef + " (" + eventLog.size() + " events)");
+        } catch (Exception e) { System.err.println("[EXPORT] events: " + e.getMessage()); }
+
+        // ── Behaviour statistics CSV (for pie/bar chart) ──────────────────
+        int tot = avoidCount + trackCount + cleanCount + wanderCount;
+        String bf = prefix + "_behaviour_stats.csv";
+        try (PrintWriter pw = new PrintWriter(new FileWriter(bf))) {
+            pw.println("behaviour,ticks,percentage");
+            pw.printf("AVOID,%d,%.2f%n",  avoidCount,  100.0*avoidCount /Math.max(1,tot));
+            pw.printf("TRACK,%d,%.2f%n",  trackCount,  100.0*trackCount /Math.max(1,tot));
+            pw.printf("CLEAN,%d,%.2f%n",  cleanCount,  100.0*cleanCount /Math.max(1,tot));
+            pw.printf("WANDER,%d,%.2f%n", wanderCount, 100.0*wanderCount/Math.max(1,tot));
+            System.out.println("[EXPORT] Behaviour stats: " + bf);
+        } catch (Exception e) { System.err.println("[EXPORT] behaviour_stats: " + e.getMessage()); }
+
+        // ── Summary report TXT ────────────────────────────────────────────
+        String rf = prefix + "_report.txt";
+        try (PrintWriter pw = new PrintWriter(new FileWriter(rf))) {
+            pw.println("=== EXPERIMENT REPORT ===");
+            pw.printf("End reason         : %s%n", reason);
+            pw.printf("Total time         : %.1f s (%.1f min)%n", elapsed, elapsed/60.0);
+            pw.printf("Distance travelled : %.2f m%n", distanceTravelled);
+            pw.printf("Final battery      : %.1f%%%n", getBatteryPercentage());
+            pw.printf("Final GPS          : (%.2f, %.2f)%n", getGPSX(), getGPSY());
+            pw.println();
+            pw.printf("Clean passes       : %d%n", cleanPassCount);
+            pw.printf("Lanes this pass    : %d%n", lanesCompleted);
+            pw.printf("Total lanes all    : %d%n", totalLanes);
+            pw.printf("WP reached         : %d / %d%n", wpIndex, waypoints.size());
+            pw.printf("WP skipped         : %d (blocked by obstacles)%n", wpSkipped);
+            pw.printf("Docked             : %b%n", docked);
+            pw.printf("Behaviour changes  : %d%n", behavTransitions);
+            pw.println();
+            pw.println("Behaviour ticks:");
+            pw.printf("  AVOID  : %6d  (%.1f%%)%n", avoidCount,  100.0*avoidCount /Math.max(1,tot));
+            pw.printf("  TRACK  : %6d  (%.1f%%)%n", trackCount,  100.0*trackCount /Math.max(1,tot));
+            pw.printf("  CLEAN  : %6d  (%.1f%%)%n", cleanCount,  100.0*cleanCount /Math.max(1,tot));
+            pw.printf("  WANDER : %6d  (%.1f%%)%n", wanderCount, 100.0*wanderCount/Math.max(1,tot));
+            System.out.println("[EXPORT] Report: " + rf);
+        } catch (Exception e) { System.err.println("[EXPORT] report: " + e.getMessage()); }
+
+        System.out.println("============================================");
+        System.out.printf("  ALL FILES SAVED with prefix: %s%n", prefix);
+        System.out.printf("  Files written to: %s%n", System.getProperty("user.dir"));
+        System.out.println("============================================");
+    }
+
+    public void update() { templateMatchingCV(getImage()); }
+
     public void toggleAutonomousMode() {
-        if (!autonomousEnabled) {
-            // Start autonomous mode:
-            autonomousEnabled = true;
-            autoInitialized = false;  // trigger init on next run() call
-            runMotion = false;          // Stop GUI-driven teleop
-            dir = 's';                  // Ensure stop command doesn't bleed through
-            if (btnAutoMode != null) {
-                btnAutoMode.setText("Auto Mode: ON");
-                btnAutoMode.setStyle("-fx-background-color: #7FFF00; ");
-            }
-            System.out.println("[GUI] Autonomous mode enabled.");
-        } else {
-            // Stop autonomous mode — re-enable manual control:
-            autonomousEnabled = false;
-            autoInitialized = false;
-            runMotion = true;
-            dir = 's';
-            setVel(0, 0);
-            currentBehavior = "MANUAL";
-            if (btnAutoMode != null) {
-                btnAutoMode.setText("Auto Mode: OFF");
-                btnAutoMode.setStyle("");
-            }
-            System.out.println("[GUI] Autonomous mode disabled — manual control restored.");
-        }
+        autonomousMode=!autonomousMode;
+        if(autonomousMode){runMotion=false;btnAutoMode.setText("Auto Mode: ON");btnAutoMode.setStyle("-fx-background-color:#7FFF00;");logEvent("AUTO_MODE","ENABLED");}
+        else{runMotion=true;setVel(0,0);btnAutoMode.setText("Auto Mode: OFF");btnAutoMode.setStyle("");logEvent("AUTO_MODE","DISABLED");}
     }
 
-    /**
-     * Method     : Controller::update()
-     * Purpose    : Called by the update thread on every tick. Runs template matching for camera.
-     * Notes      : Template matching updates getTargetX(), getTargetY(), getTargetMaxScore()
-     *              which can be used by TRACK behaviour for charger marker detection.
-     **/
-    public void update() {
-        templateMatchingCV(getImage());
-    }
-
-    /**
-     * Method     : Controller::main()
-     * Purpose    : Called by the main thread on every tick. Delegates to run() (subsumption coordinator).
-     **/
+    // =========================================================================
+    //  main() — runs every tick
+    // =========================================================================
     public void main() {
-        run();
-    }
-
-
-    /********************************************************************************************************************
-     *                                     Subsumption Architecture Coordinator                                         *
-     *                                                                                                                  *
-     *  On every tick:                                                                                                  *
-     *    1. Read front sensors (0, 1, 2), battery, GPS position                                                        *
-     *    2. Update heading estimate from GPS movement                                                                  *
-     *    3. Evaluate TLU for each behaviour (highest priority first):                                                  *
-    *         AVOID  → if front obstacle detected                                                                      *
-    *         TRACK  → if battery ≤ 20% AND camera marker is detected                                                  *
-    *         CLEAN  → if battery ≥ 40%                                                                                *
-    *         WANDER → always (fallback, scheduled random manoeuvres)                                                  *
-     *    4. Execute the highest-priority behaviour that fires                                                           *
-     *    5. Periodically log sensor data for experiment export                                                          *
-     ********************************************************************************************************************/
-
-    /**
-     * Method     : Controller::run()
-     * Purpose    : The main subsumption coordination loop.
-     * Notes      : Called at ~1000Hz by the main thread.
-     *              First call initialises autonomous mode (disables GUI teleoperation, generates waypoints).
-     *              Subsequent calls evaluate and execute behaviours.
-     **/
-    public void run() {
-
-        // ── AUTONOMOUS MODE NOT YET ENABLED — wait for button press ─────────
-        if (!autonomousEnabled) {
-            return; // do nothing; GUI teleoperation handles motion
-        }
-
-        // ── INITIALISATION (first call after enable) ───────────────────────
-        if (!autoInitialized) {
-            // Disable GUI teleoperation to prevent it overriding autonomous motor commands
-            runMotion = false;
-            initCleaningWaypoints();
-            experimentStartMs = System.currentTimeMillis();
-            autoInitialized = true;
-
+        if(!initialized){
+            initialized=true;
+            int lanes=(int)Math.ceil((CLEAN_MAX_Y-CLEAN_MIN_Y)/LANE_SPACING)+1;
             System.out.println("============================================");
-            System.out.println("  AUTONOMOUS MODE STARTED");
-            System.out.println("  Room: [" + ROOM_MIN_X + " to " + ROOM_MAX_X + "] x ["
-                    + ROOM_MIN_Y + " to " + ROOM_MAX_Y + "]");
-            System.out.println("  Charger: (" + CHARGER_XCOORD + ", " + CHARGER_YCOORD + ")");
-            System.out.println("  Waypoints: " + cleaningWaypoints.length);
-            System.out.println("  Battery: " + getBatteryPercentage() + "% (" + getBatteryTime() + "s)");
+            System.out.printf("  ROBOT READY — autonomous mode OFF%n");
+            System.out.printf("  Room [%.2f..%.2f] x [%.2f..%.2f]  Lanes:%d  LaneSpacing:%.2fm%n",
+                CLEAN_MIN_X,CLEAN_MAX_X,CLEAN_MIN_Y,CLEAN_MAX_Y,lanes,LANE_SPACING);
+            System.out.printf("  WPReach:%.2fm  TurnThreshold:%.0f°  GPSCalib:%.2fm%n",
+                WP_REACH_RADIUS,Math.toDegrees(HEADING_TURN_THRESHOLD),GPS_CALIB_DIST);
+            System.out.printf("  Heading: encoder-primary + GPS-calibrated (hybrid)%n");
             System.out.println("============================================");
-            return; // Skip first tick to let sensors stabilise
+            return;
         }
+        if(!autonomousMode) return;
 
-        // ── DOCKED → handle charging timer here (executeTrack is no longer called) ──
-        if (dockedAtCharger) {
-            setVel(0, 0);
-            if (!chargingComplete) {
-                if (chargeStartMs == 0) {
-                    chargeStartMs = System.currentTimeMillis();
-                    chargeStartBattPct = getBatteryPercentage();
-                    batteryTimer.suspend(); // Freeze battery drain while charging
-                    chargingOverridePct = chargeStartBattPct;
-                    System.out.println("============================================");
-                    System.out.println("  DOCKED AT CHARGING STATION");
-                    System.out.println("  Battery (before charge): " + String.format("%.1f", chargeStartBattPct) + "%");
-                    System.out.println("  Charging for " + (CHARGE_DURATION_MS / 1000) + "s...");
-                    System.out.println("============================================");
-                }
-                long elapsedCharge = System.currentTimeMillis() - chargeStartMs;
-                double chargeProgress = Math.min(1.0, (double) elapsedCharge / CHARGE_DURATION_MS);
-
-                // Gradually increase battery from dock-time % to 100%
-                chargingOverridePct = chargeStartBattPct + (100.0 - chargeStartBattPct) * chargeProgress;
-
-                if (elapsedCharge >= CHARGE_DURATION_MS) {
-                    batteryTimer.restart(); // counter=0 = full battery
-                    chargingOverridePct = -1.0; // Clear override
-                    chargeStartMs = 0;
-                    chargingComplete = true;
-                    System.out.println("[CHARGE] Battery restored to 100%. Ending experiment.");
-                    if (!experimentExported) {
-                        exportExperimentData("DOCKED_AND_CHARGED");
-                    }
-                }
-            }
+        if(docked){
+            // Must keep calling executeTrack while docked so that:
+            //  1. chargeOffset grows each tick  → battery percentage rises
+            //  2. getBatteryPercentage() >= 99% triggers chargingDone=true
+            //  3. exportData() and simulationComplete=true are set
+            // Passing current GPS/cam is safe — dist < 0.30 keeps robot stopped.
+            double gpsX=getGPSX(), gpsY=getGPSY(), cam=getTargetMaxScore();
+            executeTrack(gpsX, gpsY, cam);
             return;
         }
 
-        // ── READ SENSORS ──────────────────────────────────────────────────────
-        double s0 = getSonarRange(0);       // Front-left  ultrasonic (0-1m)
-        double s1 = getSonarRange(1);       // Front-centre ultrasonic
-        double s2 = getSonarRange(2);       // Front-right  ultrasonic
-        double battPct = getBatteryPercentage();  // Battery % (continuous 0.0–100.0)
-        double gpsX = getGPSX();            // Robot X position
-        double gpsY = getGPSY();            // Robot Y position
+        double s0=getSonarRange(0),s1=getSonarRange(1),s2=getSonarRange(2);
+        double batt=getBatteryPercentage(), gpsX=getGPSX(), gpsY=getGPSY(), cam=getTargetMaxScore();
+        updateDistance();
 
-        // ── UPDATE HEADING ESTIMATES ──────────────────────────────────────────
-        // 1. Encoder dead-reckoning: uses raw joint angles for proper ±π wrapping
-        updateHeadingFromEncoders(currentLeftJointPosition, currentRightJointPosition);
-        // 2. GPS heading: supplements encoders for drift correction over distance
-        estimateHeadingFromGPS(gpsX, gpsY);
+        if(batt<=0){setVel(0,0);if(!dataExported)exportData("BATTERY_DEAD");return;}
 
-        // ── COVERAGE UPDATE ──────────────────────────────────────────────────
-        markCoverage(gpsX, gpsY);
+        if     (shouldAvoid(s0,s1,s2))     executeAvoid(s0,s1,s2);
+        else if(shouldTrack(batt,cam))      executeTrack(gpsX,gpsY,cam);
+        else if(shouldClean(batt))          executeClean(gpsX,gpsY);
+        else if(shouldWander(batt))         executeWander();
 
-        // ── BATTERY DEAD CHECK (before any behaviour) ─────────────────────
-        if (battPct <= 0) {
-            setVel(0, 0);  // Stop motors immediately when battery is dead
-            if (!experimentExported) {
-                System.out.println("[BATTERY] Battery depleted! Stopping motors and exporting data...");
-                exportExperimentData("BATTERY_DEAD");
-            }
-            return;  // Do not execute any behaviour — robot is dead
+        if(!activeBehaviour.equals(prevBehaviour)){
+            logEvent("BEHAVIOUR_CHANGE",prevBehaviour+"->"+activeBehaviour+String.format(" gps=(%.2f,%.2f) batt=%.0f%%",gpsX,gpsY,batt));
+            prevBehaviour=activeBehaviour; behavTransitions++;
         }
+        if(!loggedBatt40&&batt<CLEAN_BATT_PCT){loggedBatt40=true;logEvent("BATTERY_WARN",String.format("below%.0f%% pos=(%.2f,%.2f)",CLEAN_BATT_PCT,gpsX,gpsY));}
+        if(!loggedBatt20&&batt<TRACK_BATT_PCT){loggedBatt20=true;logEvent("BATTERY_CRIT",String.format("below%.0f%% pos=(%.2f,%.2f)",TRACK_BATT_PCT,gpsX,gpsY));}
 
-        // ── AVOID SETTLE: count down heading freeze after AVOID ends ─────────
-        // When AVOID is active it sets headingFrozen = true and resets the counter.
-        // After AVOID resolves, the counter ticks down. Once it reaches 0, heading
-        // estimation resumes. This prevents the corrupted AVOID heading from
-        // leaking into CLEAN/TRACK navigation.
-        if (avoidSettleCounter > 0 && !shouldAvoid(s0, s1, s2)) {
-            avoidSettleCounter--;
-            if (avoidSettleCounter == 0) {
-                headingFrozen = false;
-            }
+        loopCount++;
+        if(loopCount%LOG_INTERVAL==0){
+            double el=getBatteryTime();
+            dataLog.add(String.format("%.1f,%.2f,%.2f,%.1f,%.4f,%.4f,%.3f,%s,%.3f,%.3f,%.3f,%.3f,%s,%d",
+                el,gpsX,gpsY,batt,getLeftWheelEnc(),getRightWheelEnc(),distanceTravelled,
+                activeBehaviour,s0,s1,s2,cam,cleanPhase.name(),wpIndex));
+            if(loopCount%(LOG_INTERVAL*10)==0)
+                System.out.printf("[%s] GPS(%.2f,%.2f) WP:%d/%d Head:%.0f° Batt:%.0f%% Dist:%.1fm%n",
+                    activeBehaviour,gpsX,gpsY,wpIndex,waypoints.size(),Math.toDegrees(headingEst),batt,distanceTravelled);
         }
-
-        // ── SUBSUMPTION: evaluate behaviours in priority order ────────────────
-        //    AVOID (1st) > TRACK (2nd) > CLEAN (3rd) > WANDER (4th)
-
-        if (shouldAvoid(s0, s1, s2)) {
-            executeAvoid(s0, s1, s2);
-        }
-        else if (shouldTrack(battPct, getTargetMaxScore())) {
-            executeTrack(gpsX, gpsY, getTargetMaxScore());
-        }
-        else if (shouldClean(battPct)) {
-            executeClean(gpsX, gpsY);
-        }
-        else {
-            executeWander();
-        }
-
-        // ── DATA LOGGING (every ~250 ticks ≈ every 10 seconds at ~24Hz) ──────
-        loopCounter++;
-        if (loopCounter % 250 == 0) {
-            long elapsedMs = System.currentTimeMillis() - experimentStartMs;
-            double elapsedSec = elapsedMs / 1000.0;
-
-                dataLog.add(String.format("%.1f,%.2f,%.2f,%.1f,%.2f,%.2f,%.1f,%s",
-                    elapsedSec, gpsX, gpsY, battPct,
-                    getLeftWheelEnc(), getRightWheelEnc(),
-                    getCoveragePercent(),
-                    currentBehavior));
-        }
-
-        // ── STATUS PRINT (throttled) ──────────────────────────────────────────
-        if (loopCounter % STATUS_PRINT_INTERVAL == 0) {
-            System.out.printf("[%s] GPS(%.2f, %.2f) Batt:%.0f%% Hdg:%.0f° Dist:%.1fm Sonar[%.2f %.2f %.2f] WP:%d/%d%n",
-                    currentBehavior, gpsX, gpsY, battPct,
-                    Math.toDegrees(robotHeading), distanceTravelled,
-                    s0, s1, s2,
-                    totalWaypointsReached, cleaningWaypoints != null ? cleaningWaypoints.length : 0);
-        }
-    }
-
-
-    /********************************************************************************************************************
-     *                                         Experiment Data Export                                                    *
-     *                                                                                                                  *
-     *  Exports collected sensor data to CSV files for analysis:                                                        *
-     *    1. GPS trajectory data (time, x, y, battery, wheel encoders, behaviour)                                       *
-     *    2. Summary report (total distance, behaviour activations, outcome)                                            *
-     ********************************************************************************************************************/
-
-    /**
-     * Method     : Controller::exportExperimentData()
-     * Purpose    : Writes collected experiment data to CSV and summary files.
-     * Parameters : reason - why the experiment ended ("DOCKED", "BATTERY_DEAD", etc.)
-     **/
-    private void exportExperimentData(String reason) {
-        if (experimentExported) return;
-        experimentExported = true;
-
-        long timestamp = System.currentTimeMillis();
-        long totalTimeMs = timestamp - experimentStartMs;
-        double totalTimeSec = totalTimeMs / 1000.0;
-
-        // ── Export GPS trajectory CSV ─────────────────────────────────────
-        String trajectoryFile = "gps_trajectory_" + timestamp + ".csv";
-        try (PrintWriter pw = new PrintWriter(new FileWriter(trajectoryFile))) {
-            pw.println("time_sec,gps_x,gps_y,battery_pct,left_enc,right_enc,coverage_pct,behavior");
-            for (String row : dataLog) {
-                pw.println(row);
-            }
-            System.out.println("[EXPORT] Trajectory saved: " + trajectoryFile + " (" + dataLog.size() + " rows)");
-        } catch (Exception e) {
-            System.err.println("[EXPORT] Error writing trajectory: " + e.getMessage());
-        }
-
-        // ── Export summary report ─────────────────────────────────────────
-        String summaryFile = "experiment_report_" + timestamp + ".txt";
-        try (PrintWriter pw = new PrintWriter(new FileWriter(summaryFile))) {
-            pw.println("=== EXPERIMENT SUMMARY ===");
-            pw.println("End reason       : " + reason);
-            pw.println("Total time       : " + String.format("%.1f", totalTimeSec) + " seconds");
-            pw.println("Distance travelled: " + String.format("%.2f", distanceTravelled) + " metres");
-            pw.println("Coverage: " + String.format("%.1f", getCoveragePercent()) + "% of room area");
-            pw.println("Final GPS        : (" + getGPSX() + ", " + getGPSY() + ")");
-            pw.println("Final battery    : " + getBatteryPercentage() + "%");
-            int patternPasses = totalWaypointsReached / cleaningWaypoints.length;
-            int partialWPs = totalWaypointsReached % cleaningWaypoints.length;
-            pw.println("Waypoints reached: " + totalWaypointsReached
-                    + " (" + patternPasses + " full passes + " + partialWPs + " partial)");
-            pw.println("");
-            pw.println("Behaviour activations (ticks):");
-            pw.println("  AVOID  : " + avoidActivations);
-            pw.println("  TRACK  : " + trackActivations);
-            pw.println("  CLEAN  : " + cleanActivations);
-            pw.println("  WANDER : " + wanderActivations);
-            pw.println("");
-            pw.println("Charger location : (" + CHARGER_XCOORD + ", " + CHARGER_YCOORD + ")");
-            pw.println("Room boundaries  : [" + ROOM_MIN_X + ", " + ROOM_MAX_X + "] x ["
-                    + ROOM_MIN_Y + ", " + ROOM_MAX_Y + "]");
-            pw.println("Cleaning area    : [" + (ROOM_MIN_X+WALL_MARGIN) + ", " + (ROOM_MAX_X-WALL_MARGIN) + "] x ["
-                    + (ROOM_MIN_Y+WALL_MARGIN) + ", " + (ROOM_MAX_Y-WALL_MARGIN) + "]");
-            pw.println("Wall margin      : " + WALL_MARGIN + " metres");
-            pw.println("Lane spacing     : " + LANE_SPACING + " metres");
-            int totalTicks = avoidActivations + trackActivations + cleanActivations + wanderActivations;
-            pw.println("AVOID fraction   : " + (totalTicks>0 ? String.format("%.1f", 100.0*avoidActivations/totalTicks) : "0") + "%");
-            pw.println("Docked           : " + dockedAtCharger);
-            System.out.println("[EXPORT] Summary saved: " + summaryFile);
-        } catch (Exception e) {
-            System.err.println("[EXPORT] Error writing summary: " + e.getMessage());
-        }
-
-        // ── Export coverage grid ────────────────────────────────────────────
-        String coverageFile = "coverage_grid_" + timestamp + ".csv";
-        try (PrintWriter pw = new PrintWriter(new FileWriter(coverageFile))) {
-            pw.println("# Coverage grid: " + coverageRows + "x" + coverageCols
-                    + "  cell_m=" + String.format("%.3f", COVERAGE_RES)
-                    + "  origin=(" + CLEAN_MIN_X + "," + CLEAN_MIN_Y + ")");
-            for (int r = 0; r < coverageRows; r++) {
-                for (int c = 0; c < coverageCols; c++) {
-                    pw.print(coverageGrid[r][c] ? "1" : "0");
-                    if (c < coverageCols - 1) pw.print(",");
-                }
-                pw.println();
-            }
-            System.out.println("[EXPORT] Coverage grid saved: " + coverageFile + " (" + coverageRows + "x" + coverageCols + ")");
-        } catch (Exception e) {
-            System.err.println("[EXPORT] Error writing coverage grid: " + e.getMessage());
-        }
-
-        // ── Print summary to console ──────────────────────────────────────
-        System.out.println("============================================");
-        System.out.println("  EXPERIMENT COMPLETE: " + reason);
-        System.out.println("  Time: " + String.format("%.1f", totalTimeSec) + "s");
-        System.out.println("  Distance: " + String.format("%.2f", distanceTravelled) + "m");
-        System.out.println("  Coverage: " + String.format("%.1f", getCoveragePercent()) + "%");
-        System.out.println("  Waypoints: " + totalWaypointsReached + " total ("
-                + (totalWaypointsReached / cleaningWaypoints.length) + " full passes)");
-        System.out.println("  Docked: " + dockedAtCharger);
-        System.out.println("============================================");
     }
 }
