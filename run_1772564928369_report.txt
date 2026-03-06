@@ -1,0 +1,20 @@
+=== EXPERIMENT REPORT ===
+End reason         : CHARGE_COMPLETE
+Total time         : 664.0 s (11.1 min)
+Distance travelled : 180.09 m
+Final battery      : 99.1%
+Final GPS          : (1.56, -0.71)
+
+Clean passes       : 2
+Lanes this pass    : 0
+Total lanes all    : 0
+WP reached         : 0 / 22
+WP skipped         : 51 (blocked by obstacles)
+Docked             : true
+Behaviour changes  : 81
+
+Behaviour ticks:
+  AVOID  :   1748  (19.2%)
+  TRACK  :    638  (7.0%)
+  CLEAN  :   5157  (56.6%)
+  WANDER :   1566  (17.2%)

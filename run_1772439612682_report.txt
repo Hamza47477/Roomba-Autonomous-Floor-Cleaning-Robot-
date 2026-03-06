@@ -1,0 +1,19 @@
+=== EXPERIMENT REPORT ===
+End reason         : BATTERY_DEAD
+Total time         : 753.0 s (12.6 min)
+Distance travelled : 45.49 m
+Final battery      : 0.0%
+Final GPS          : (0.00, 0.00)
+
+Clean passes       : 0
+Lanes this pass    : 4
+Total lanes all    : 0
+Lanes this run     : 4
+Docked             : false
+Behaviour changes  : 21
+
+Behaviour ticks:
+  AVOID  :   1554  (33.0%)
+  TRACK  :    620  (13.2%)
+  CLEAN  :   2079  (44.2%)
+  WANDER :    453  (9.6%)

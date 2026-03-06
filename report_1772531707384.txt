@@ -1,0 +1,13 @@
+═══════════════════════════════════
+  REPORT v5.1   BATTERY_DEAD
+═══════════════════════════════════
+Duration:    2697.0 s
+Distance:    27.36 m
+Coverage:    32.4 %
+Battery:     100.0 %
+WPs reached: 1/22
+Docked: false
+Avoid:7646(53.6%)  Track:2153(15.1%)  Clean:3186(22.3%)  Wander:1281(9.0%)
+
+cov(d,t)=6183.8914  r(d,t)=0.9526
+Strong linear: robot explored efficiently.
